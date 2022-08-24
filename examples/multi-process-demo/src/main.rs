@@ -38,7 +38,7 @@ fn main() -> Result<()> {
         println!("exit log_str");
         0
     });
-    let instance = Instance::new(&mut store, &module, 
+    let instance = Instance::new_for_multi_process(&mut store, &module, 
         &[("log_str", log_str.into())])?;
     let foo = instance.get_func(& mut store, "foo").unwrap();
     foo.spawn_and_call(&instance, &mut store)?;

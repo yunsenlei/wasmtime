@@ -104,21 +104,21 @@ impl Instance {
     ///
     /// [inst]: https://webassembly.github.io/spec/core/exec/modules.html#exec-instantiation
     /// [`ExternType`]: crate::ExternType
-    // pub fn new(
-    //     mut store: impl AsContextMut,
-    //     module: &Module,
-    //     imports: &[Extern],
-    // ) -> Result<Instance, Error> {
-    //     let mut store = store.as_context_mut();
-    //     let imports = Instance::typecheck_externs(store.0, module, imports)?;
-    //     // Note that the unsafety here should be satisfied by the call to
-    //     // `typecheck_externs` above which satisfies the condition that all
-    //     // the imports are valid for this module.
-    //     unsafe { Instance::new_started(&mut store, module, imports.as_ref()) }
-    // }
+    pub fn new(
+        mut store: impl AsContextMut,
+        module: &Module,
+        imports: &[Extern],
+    ) -> Result<Instance, Error> {
+        let mut store = store.as_context_mut();
+        let imports = Instance::typecheck_externs(store.0, module, imports)?;
+        // Note that the unsafety here should be satisfied by the call to
+        // `typecheck_externs` above which satisfies the condition that all
+        // the imports are valid for this module.
+        unsafe { Instance::new_started(&mut store, module, imports.as_ref()) }
+    }
 
     /// create instance, but also add import information so it's convenient fo host process knows which imported function guest calls
-    pub fn new(mut store: impl AsContextMut, module: &Module, imports: &[(&str, Extern)]
+    pub fn new_for_multi_process(mut store: impl AsContextMut, module: &Module, imports: &[(&str, Extern)]
     ) -> Result<Instance, Error> {
         let mut store = store.as_context_mut();
         let ownedimports = Instance::typecheck_named_extern(store.0, module, imports)?;
