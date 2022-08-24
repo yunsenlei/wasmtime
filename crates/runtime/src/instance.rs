@@ -20,6 +20,7 @@ use memoffset::offset_of;
 use more_asserts::assert_lt;
 use std::alloc::Layout;
 use std::any::Any;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::hash::Hash;
 use std::ops::Range;
@@ -31,8 +32,10 @@ use wasmtime_environ::{
     packed_option::ReservedValue, DataIndex, DefinedGlobalIndex, DefinedMemoryIndex,
     DefinedTableIndex, ElemIndex, EntityIndex, EntityRef, EntitySet, FuncIndex, GlobalIndex,
     GlobalInit, HostPtr, MemoryIndex, Module, PrimaryMap, SignatureIndex, TableIndex,
-    TableInitialization, TrapCode, VMOffsets, WasmType,
+    TableInitialization, TrapCode, VMOffsets, WasmType, ParamTypeIndex,
 };
+
+use wasmtime_param_types::FuncParamRetTypes;
 
 mod allocator;
 
@@ -64,6 +67,9 @@ pub(crate) struct Instance {
 
     /// Offsets in the `vmctx` region, precomputed from the `module` above.
     offsets: VMOffsets<HostPtr>,
+
+    /// get func_names from vmctx
+    import_func_names: HashMap<CtxWrap, String>,
 
     /// WebAssembly linear memory data.
     ///
@@ -117,12 +123,22 @@ impl Instance {
         let module = req.runtime_info.module();
         let dropped_elements = EntitySet::with_capacity(module.passive_elements.len());
         let dropped_data = EntitySet::with_capacity(module.passive_data_map.len());
+        let mut import_func_names = HashMap::new();
+        // if the function name is empty, then it suggests that we didn't insert it, so we left the import_func_names empty
+        for (i, func_name) in req.imports.func_names.iter().enumerate(){
+            let func = &req.imports.functions[i];
+            let vmctx = func.vmctx;
+            // println!("[Instance::new_at] {}, {:?}", func_name, vmctx);
+            let k = CtxWrap(vmctx);
+            import_func_names.insert(k, func_name.clone());
+        }
 
         ptr::write(
             ptr,
             Instance {
                 runtime_info: req.runtime_info.clone(),
                 offsets,
+                import_func_names,
                 memories,
                 tables,
                 dropped_elements,
@@ -291,6 +307,13 @@ impl Instance {
         let anyfunc = self.get_caller_checked_anyfunc(index).unwrap();
         let anyfunc = NonNull::new(anyfunc as *const VMCallerCheckedAnyfunc as *mut _).unwrap();
         ExportFunction { anyfunc }
+    }
+
+    fn get_exported_func_and_param_type(&mut self, index: FuncIndex) -> (ExportFunction, FuncParamRetTypes){
+        let anyfunc = self.get_caller_checked_anyfunc(index).unwrap();
+        let param_types= self.get_func_param_type(index).unwrap();
+        let anyfunc = NonNull::new(anyfunc as *const VMCallerCheckedAnyfunc as *mut _).unwrap();
+        (ExportFunction { anyfunc }, param_types.clone())
     }
 
     fn get_exported_table(&mut self, index: TableIndex) -> ExportTable {
@@ -545,6 +568,21 @@ impl Instance {
 
             Some(anyfunc)
         }
+    }
+
+    pub(crate) fn get_func_param_type(
+        &self,
+        index: FuncIndex,
+    ) -> Option<&FuncParamRetTypes>{
+        if index == FuncIndex::reserved_value(){
+            return None;
+        }
+        let func = &self.module().functions[index];
+        let ty_index = func.param_type;
+        if ty_index == ParamTypeIndex::reserved_value() {
+            return None;
+        }
+        self.module().func_pr_types.get(ty_index)
     }
 
     /// The `table.init` operation: initializes a portion of a table with a
@@ -1022,6 +1060,13 @@ impl Drop for Instance {
     }
 }
 
+/// A wrap for vmctx
+#[derive(Debug, Hash, PartialEq, Eq)]
+
+pub struct CtxWrap(*mut VMOpaqueContext);
+unsafe impl Send for CtxWrap {}
+unsafe impl Sync for CtxWrap {}
+
 /// A handle holding an `Instance` of a WebAssembly module.
 #[derive(Hash, PartialEq, Eq)]
 pub struct InstanceHandle {
@@ -1051,6 +1096,11 @@ impl InstanceHandle {
         Self {
             instance: instance as *const Instance as *mut Instance,
         }
+    }
+    
+    /// debug 
+    pub fn print_instance_val(&self){
+        println!("[print_instance_val]: {:?}", self.instance);
     }
 
     /// Return a reference to the vmctx used by compiled wasm code.
@@ -1087,6 +1137,23 @@ impl InstanceHandle {
     /// Lookup a table by index.
     pub fn get_exported_table(&mut self, export: TableIndex) -> ExportTable {
         self.instance_mut().get_exported_table(export)
+    }
+
+    /// Lookup a function's parameter type by index.
+    pub fn get_expored_func_param_types(&mut self, export: EntityIndex) -> Option<&FuncParamRetTypes> {
+        match export {
+            EntityIndex::Function(i) =>self.instance_mut().get_func_param_type(i),
+            _ => None
+        }
+    }
+
+    /// Look up a function's import name
+    pub fn get_func_name_from_vmctx(&self, vmctx: *mut VMOpaqueContext) -> Result<String, ()>{
+        if let Some(name) = self.instance().import_func_names.get(&CtxWrap(vmctx)){
+            Ok(name.clone())
+        }else{
+            Err(())
+        }
     }
 
     /// Lookup an item with the given index.

@@ -1,5 +1,6 @@
 use crate::store::StoreOpaque;
 use crate::{StoreContext, StoreContextMut};
+use crate::mem_values::ParamRetData;
 use std::fmt;
 use std::marker;
 use std::num::NonZeroU64;
@@ -16,6 +17,7 @@ pub struct InstanceId(pub(super) usize);
 pub struct StoreData {
     id: StoreId,
     funcs: Vec<crate::func::FuncData>,
+    func_data: Vec<crate::mem_values::ParamRetData>,
     tables: Vec<wasmtime_runtime::ExportTable>,
     globals: Vec<wasmtime_runtime::ExportGlobal>,
     instances: Vec<crate::instance::InstanceData>,
@@ -53,6 +55,7 @@ impl StoreData {
         StoreData {
             id: StoreId::allocate(),
             funcs: Vec::new(),
+            func_data: Vec::new(),
             tables: Vec::new(),
             globals: Vec::new(),
             instances: Vec::new(),
@@ -74,6 +77,20 @@ impl StoreData {
         let index = list.len();
         list.push(data);
         Stored::new(self.id, index)
+    }
+
+    pub fn reserve_data_storage_for_func(&mut self, func_name: &str) -> usize {
+        let index = self.func_data.len();
+        self.func_data.push(ParamRetData::new_with_name(func_name));
+        index
+    }
+
+    pub fn func_data(&self) -> &Vec<ParamRetData> {
+        &self.func_data
+    }
+
+    pub fn func_data_mut(&mut self) -> &mut Vec<ParamRetData>{
+        &mut self.func_data
     }
 
     pub fn next_id<T>(&self) -> Stored<T>

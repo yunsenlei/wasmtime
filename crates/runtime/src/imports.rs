@@ -15,6 +15,9 @@ use crate::vmcontext::{VMFunctionImport, VMGlobalImport, VMMemoryImport, VMTable
 pub struct Imports<'a> {
     /// Resolved addresses for imported functions.
     pub functions: &'a [VMFunctionImport],
+    
+    /// Names for the above imported functions, in the same order
+    pub func_names: &'a [String],
 
     /// Resolved addresses for imported tables.
     pub tables: &'a [VMTableImport],

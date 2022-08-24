@@ -98,6 +98,10 @@ impl MatchCx<'_> {
                 Extern::Func(actual) => self.func(*expected, actual),
                 _ => bail!("expected func, but found {}", actual.desc()),
             },
+            EntityType::ParamTypedFunction(expected,_) => match actual {
+                Extern::Func(actual) => self.func(*expected, actual),
+                _ => bail!("expected func, but found {}", actual.desc()),
+            },
             EntityType::Tag(_) => unimplemented!(),
         }
     }
@@ -106,10 +110,15 @@ impl MatchCx<'_> {
     pub(crate) fn definition(&self, expected: &EntityType, actual: &Definition) -> Result<()> {
         match actual {
             Definition::Extern(e) => self.extern_(expected, e),
+            Definition::ParamTypedExtern((e, _pty)) => self.extern_(expected, e),
             Definition::HostFunc(f) => match expected {
                 EntityType::Function(expected) => self.host_func(*expected, f),
                 _ => bail!("expected {}, but found func", entity_desc(expected)),
             },
+            Definition::ParamTypedHostFunc((f, _pty)) => match expected {
+                EntityType::Function(expected) => self.host_func(*expected, f),
+                _ => bail!("expected {}, but found func", entity_desc(expected)),
+            }
         }
     }
 }
@@ -150,6 +159,22 @@ pub fn entity_ty(
             }
             _ => bail!("expected func found {}", entity_desc(actual)),
         },
+        EntityType::ParamTypedFunction(expected, _) => match actual {
+            EntityType::Function(actual) => {
+                let expected = &expected_types[*expected];
+                let actual = &actual_types[*actual];
+                if expected == actual {
+                    Ok(())
+                } else {
+                    Err(func_ty_mismatch(
+                        "function types incompaible",
+                        expected,
+                        actual,
+                    ))
+                }
+            }
+            _ => bail!("expected func found {}", entity_desc(actual)),
+        }
         EntityType::Tag(_) => unimplemented!(),
     }
 }
@@ -295,6 +320,7 @@ fn entity_desc(ty: &EntityType) -> &'static str {
         EntityType::Table(_) => "table",
         EntityType::Memory(_) => "memory",
         EntityType::Function(_) => "func",
+        EntityType::ParamTypedFunction(..) => "param typed func",
         EntityType::Tag(_) => "tag",
     }
 }

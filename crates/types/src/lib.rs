@@ -214,6 +214,11 @@ entity_impl!(TypeIndex);
 pub struct TagIndex(u32);
 entity_impl!(TagIndex);
 
+/// Index type an function's parameter type associated with functions
+#[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct ParamTypeIndex(u32);
+entity_impl!(ParamTypeIndex);
+
 /// An index of an entity.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub enum EntityIndex {
@@ -267,6 +272,9 @@ pub enum EntityType {
     /// A function type where the index points to the type section and records a
     /// function signature.
     Function(SignatureIndex),
+    
+    /// Same as function type, buth with extra attached param type
+    ParamTypedFunction(SignatureIndex, ParamTypeIndex),
 }
 
 /// A WebAssembly global.

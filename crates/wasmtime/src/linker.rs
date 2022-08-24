@@ -14,7 +14,7 @@ use std::marker;
 #[cfg(feature = "async")]
 use std::pin::Pin;
 use std::sync::Arc;
-
+use wasmtime_param_types::{ParamRetType, FuncParamRetTypes, FuncPRTypeCollection};
 /// Structure used to link wasm modules/instances together.
 ///
 /// This structure is used to assist in instantiating a [`Module`]. A [`Linker`]
@@ -114,7 +114,9 @@ struct ImportKey {
 #[derive(Clone)]
 pub(crate) enum Definition {
     Extern(Extern),
+    ParamTypedExtern((Extern, FuncParamRetTypes)),
     HostFunc(Arc<HostFunc>),
+    ParamTypedHostFunc((Arc<HostFunc>, FuncParamRetTypes)),
 }
 
 macro_rules! generate_wrap_async_func {
@@ -313,6 +315,24 @@ impl<T> Linker<T> {
         self.insert(key, Definition::HostFunc(Arc::new(func)))?;
         Ok(self)
     }
+    
+    /// Similar to Func::new, but with extra parameter type argument
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub fn func_new_with_pty(
+        &mut self,
+        module: &str,
+        name: &str,
+        ty: FuncType,
+        params_type: impl IntoIterator<Item = ParamRetType>,
+        func_name: &str,
+        func: impl Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<(), Trap> + Send + Sync + 'static,
+    ) -> Result<&mut Self> {
+        let func = HostFunc::new(&self.engine, ty, func);
+        let key = self.import_key(module, Some(name));
+        self.insert(key, Definition::ParamTypedHostFunc((Arc::new(func), FuncParamRetTypes::new(params_type, func_name))))?;
+        Ok(self)
+    }
 
     /// Creates a [`Func::new_unchecked`]-style function named in this linker.
     ///
@@ -441,6 +461,22 @@ impl<T> Linker<T> {
         Ok(self)
     }
 
+    /// Similar to Linker::func_wrap but with extra parameter type argument
+    pub fn func_wrap_with_pty<Params, Args>(
+        &mut self,
+        module: &str,
+        name: &str,
+        params_type: impl IntoIterator<Item = ParamRetType>,
+        func: impl IntoFunc<T, Params, Args>,
+    ) -> Result<&mut Self> {
+        let func = HostFunc::wrap(&self.engine, func);
+        let key = self.import_key(module, Some(name));
+        self.insert(key, Definition::ParamTypedHostFunc((Arc::new(func), FuncParamRetTypes::new(params_type, name))))?;
+        Ok(self)
+        
+    }
+    
+
     for_each_function_signature!(generate_wrap_async_func);
 
     /// Convenience wrapper to define an entire [`Instance`] in this linker.
@@ -506,8 +542,31 @@ impl<T> Linker<T> {
         instance: Instance,
     ) -> Result<&mut Self> {
         for export in instance.exports(store.as_context_mut()) {
-            let key = self.import_key(module_name, Some(export.name()));
+            let key = self.import_key(module_name, Some(export.name()));  
             self.insert(key, Definition::Extern(export.into_extern()))?;
+        }
+        Ok(self)
+    }
+
+
+    /// Similar to Linker::instance, but with extra parmeter that describe each export's parameter type
+    pub fn instance_with_param_type(
+        &mut self,
+        mut store: impl AsContextMut<Data = T>,
+        module_name: &str,
+        instance: Instance,
+        map: &FuncPRTypeCollection
+    ) -> Result<&mut Self> {
+        for export in instance.exports(store.as_context_mut()) {
+            let key = self.import_key(module_name, Some(export.name()));
+            if let Some(func_pty) = map.get(&export.name().to_string()){
+                println!("found matched param type for {}", export.name());
+               self.insert(key, Definition::ParamTypedExtern((export.into_extern(), func_pty.to_owned())))?; 
+            }
+            else {
+                self.insert(key, Definition::Extern(export.into_extern()))?;
+            }
+            
         }
         Ok(self)
     }
@@ -1190,7 +1249,9 @@ impl Definition {
     pub(crate) unsafe fn to_extern(&self, store: &mut StoreOpaque) -> Extern {
         match self {
             Definition::Extern(e) => e.clone(),
+            Definition::ParamTypedExtern((e, _pty)) => e.clone(),
             Definition::HostFunc(func) => func.to_func(store).into(),
+            Definition::ParamTypedHostFunc((func, _pty)) =>func.to_func(store).into(),
         }
     }
 
@@ -1199,14 +1260,27 @@ impl Definition {
     pub(crate) unsafe fn to_extern_store_rooted(&self, store: &mut StoreOpaque) -> Extern {
         match self {
             Definition::Extern(e) => e.clone(),
+            Definition::ParamTypedExtern((e, pty)) => 
+            {
+                let e_clone = e.clone();
+                if let Some(f) = e_clone.into_func(){
+                    f.update_params_type(store, pty.clone());
+                    return Extern::Func(f);
+                }
+                e.clone()
+            },
             Definition::HostFunc(func) => func.to_func_store_rooted(store).into(),
+            Definition::ParamTypedHostFunc((func, pty)) => 
+            func.to_func_store_rooted_with_param_type(pty.to_owned(), store).into(),
         }
     }
 
     pub(crate) fn comes_from_same_store(&self, store: &StoreOpaque) -> bool {
         match self {
             Definition::Extern(e) => e.comes_from_same_store(store),
+            Definition::ParamTypedExtern((e, _pty)) => e.comes_from_same_store(store),
             Definition::HostFunc(_func) => true,
+            Definition::ParamTypedHostFunc((_func, _pty)) => true,
         }
     }
 }

@@ -19,6 +19,7 @@ serde = { version = "1.0.94", features = ["derive"] }
 sha2 = "0.9.0"
 toml = "0.5.5"
 zstd = { version = "0.11.1", default-features = false }
+wasmtime-param-types = { path = "../param-types", version = "0.1.0" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 winapi = "0.3.7"

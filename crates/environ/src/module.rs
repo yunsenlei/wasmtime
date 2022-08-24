@@ -4,6 +4,7 @@ use crate::{ModuleTranslation, PrimaryMap, Tunables, WASM_PAGE_SIZE};
 use cranelift_entity::{packed_option::ReservedValue, EntityRef};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use wasmtime_param_types::FuncParamRetTypes;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::mem;
@@ -775,6 +776,9 @@ pub struct Module {
     /// Exported entities.
     pub exports: IndexMap<String, EntityIndex>,
 
+    /// Parameter type entities
+    pub pr_type_indexes: IndexMap<String, ParamTypeIndex>,
+
     /// The module "start" function, if present.
     pub start_func: Option<FuncIndex>,
 
@@ -817,6 +821,9 @@ pub struct Module {
 
     /// Types of functions, imported and local.
     pub functions: PrimaryMap<FuncIndex, FunctionType>,
+
+    /// Types of the parameter of functions,
+    pub func_pr_types: PrimaryMap<ParamTypeIndex, FuncParamRetTypes>,
 
     /// WebAssembly tables.
     pub table_plans: PrimaryMap<TableIndex, TablePlan>,
@@ -999,7 +1006,24 @@ impl Module {
         self.functions.push(FunctionType {
             signature,
             anyfunc: AnyfuncIndex::reserved_value(),
+            param_type: ParamTypeIndex::reserved_value(),
         })
+    }
+
+    /// Same as push_function, but we set parameter_type's index
+    pub fn push_function_with_pr_type(&mut self, signature: SignatureIndex, index: ParamTypeIndex) -> FuncIndex {
+        self.functions.push(FunctionType {
+            signature,
+            anyfunc: AnyfuncIndex::reserved_value(),
+            param_type: index,
+        })
+    }
+    
+    /// update the FunctionType with parameter type's index
+    pub fn update_function_parameter_type(&mut self, index: FuncIndex, p_index: ParamTypeIndex) {
+        if let Some(f) = self.functions.get_mut(index){
+            f.param_type = p_index;
+        }    
     }
 
     /// Appends a new function to this module with the given type information.
@@ -1008,7 +1032,7 @@ impl Module {
         signature: SignatureIndex,
         anyfunc: AnyfuncIndex,
     ) -> FuncIndex {
-        self.functions.push(FunctionType { signature, anyfunc })
+        self.functions.push(FunctionType { signature, anyfunc, param_type: ParamTypeIndex::reserved_value()})
     }
 }
 
@@ -1021,6 +1045,8 @@ pub struct FunctionType {
     /// The index into the anyfunc table, if present. Note that this is
     /// `reserved_value()` if the function does not escape from a module.
     pub anyfunc: AnyfuncIndex,
+    /// the index into the parameter type tables
+    pub param_type: ParamTypeIndex
 }
 
 impl FunctionType {

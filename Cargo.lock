@@ -89,9 +89,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.57"
+version = "1.0.58"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08f9b8508dccb7687a1d6c4ce66b2b0ecef467c94667de27d8d7fe1f8d2a9cdc"
+checksum = "bb07d2053ccdbe10e2af2995a2f116c1330396493dc1269f6a91d0ae82e19704"
 
 [[package]]
 name = "arbitrary"
@@ -1189,6 +1189,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "fork"
+version = "0.1.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57b4f1a740392e495821244cc1658d86496ac6e67a47da67e243ed401b937717"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "fs-set-times"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1730,6 +1739,14 @@ name = "more-asserts"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7843ec2de400bcbc6a6328c958dc38e5359da6e93e72e37bc5246bf1ae776389"
+
+[[package]]
+name = "multi-process-demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wasmtime",
+]
 
 [[package]]
 name = "ntapi"
@@ -2538,9 +2555,9 @@ dependencies = [
 
 [[package]]
 name = "serde_json"
-version = "1.0.80"
+version = "1.0.83"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f972498cf015f7c0746cac89ebe1d6ef10c293b94175a243a2d9442c163d9944"
+checksum = "38dd04e3c8279e75b31ef29dbdceebfe5ad89f4d0937213c53f7d49d01b3d5a7"
 dependencies = [
  "itoa 1.0.1",
  "ryu",
@@ -2874,10 +2891,11 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.18.1"
+version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce653fb475565de9f6fb0614b28bca8df2c430c0cf84bcd9c843f15de5414cc"
+checksum = "7a8325f63a7d4774dd041e363b2409ed1c5cbbd0f867795e661df066b2b0a581"
 dependencies = [
+ "autocfg 1.1.0",
  "bytes",
  "libc",
  "memchr",
@@ -3317,7 +3335,9 @@ dependencies = [
  "backtrace",
  "bincode",
  "cfg-if",
+ "fork",
  "indexmap",
+ "itertools",
  "lazy_static",
  "libc",
  "log",
@@ -3328,6 +3348,7 @@ dependencies = [
  "rayon",
  "region",
  "serde",
+ "serde_json",
  "target-lexicon",
  "tempfile",
  "wasi-cap-std-sync",
@@ -3337,6 +3358,7 @@ dependencies = [
  "wasmtime-environ",
  "wasmtime-fiber",
  "wasmtime-jit",
+ "wasmtime-param-types",
  "wasmtime-runtime",
  "wasmtime-wasi",
  "wat",
@@ -3402,6 +3424,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "wasmtime-param-types",
  "winapi",
  "zstd",
 ]
@@ -3493,6 +3516,7 @@ dependencies = [
  "target-lexicon",
  "thiserror",
  "wasmparser",
+ "wasmtime-param-types",
  "wasmtime-types",
 ]
 
@@ -3582,6 +3606,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasmtime-param-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "wasmtime-runtime"
 version = "0.39.0"
 dependencies = [
@@ -3603,6 +3636,7 @@ dependencies = [
  "wasmtime-environ",
  "wasmtime-fiber",
  "wasmtime-jit-debug",
+ "wasmtime-param-types",
  "winapi",
 ]
 

@@ -6,6 +6,7 @@ use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use wasmtime_param_types::FuncPRTypeCollection;
 
 #[macro_use] // for tests
 mod config;
@@ -96,6 +97,48 @@ impl<'config> ModuleCacheEntry<'config> {
             }
         }
         let val_to_cache = compute(state)?;
+        if let Some(bytes) = serialize(state, &val_to_cache) {
+            if inner.update_data(&hash, &bytes).is_some() {
+                let mod_cache_path = inner.root_path.join(&hash);
+                inner.cache_config.on_cache_update_async(&mod_cache_path); // call on success
+            }
+        }
+        Ok(val_to_cache)
+    }
+    
+    /// The same as get_data_raw, but the build_aritfacts takes eaxtra argument as parameter type information    
+    pub fn get_data_raw_with_pr_types<T, U, E>(
+        &self,
+        state: &T,
+        func_pr_types: &FuncPRTypeCollection,
+        // NOTE: These are function pointers instead of closures so that they
+        // don't accidentally close over something not accounted in the cache.
+        compute: fn(&T, &FuncPRTypeCollection) -> Result<U, E>,
+        serialize: fn(&T, &U) -> Option<Vec<u8>>,
+        deserialize: fn(&T, Vec<u8>) -> Option<U>,
+    ) -> Result<U, E>
+    where
+        T: Hash,
+    {
+        let inner = match &self.0 {
+            Some(inner) => inner,
+            None => return compute(state, func_pr_types),
+        };
+
+        let mut hasher = Sha256Hasher(Sha256::new());
+        state.hash(&mut hasher);
+        let hash: [u8; 32] = hasher.0.finalize().into();
+        // standard encoding uses '/' which can't be used for filename
+        let hash = base64::encode_config(&hash, base64::URL_SAFE_NO_PAD);
+
+        if let Some(cached_val) = inner.get_data(&hash) {
+            if let Some(val) = deserialize(state, cached_val) {
+                let mod_cache_path = inner.root_path.join(&hash);
+                inner.cache_config.on_cache_get_async(&mod_cache_path); // call on success
+                return Ok(val);
+            }
+        }
+        let val_to_cache = compute(state, func_pr_types)?;
         if let Some(bytes) = serialize(state, &val_to_cache) {
             if inner.update_data(&hash, &bytes).is_some() {
                 let mod_cache_path = inner.root_path.join(&hash);

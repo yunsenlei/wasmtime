@@ -14,6 +14,7 @@ edition = "2021"
 anyhow = "1.0"
 cranelift-entity = { path = "../../cranelift/entity", version = "0.86.0" }
 wasmtime-types = { path = "../types", version = "0.39.0" }
+wasmtime-param-types = { path = "../param-types", version = "0.1.0" }
 wasmparser = "0.86.0"
 indexmap = { version = "1.0.2", features = ["serde-1"] }
 thiserror = "1.0.4"

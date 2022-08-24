@@ -544,16 +544,18 @@ macro_rules! impl_wasm_params {
             #[inline]
             fn into_abi(self, _store: &mut StoreOpaque) -> Option<Self::Abi> {
                 let ($($t,)*) = self;
+                
                 $(
                     let $t = if $t.compatible_with_store(_store) {
+                        println!("{:?}", $t::valtype());
                         $t.into_abi(_store)
                     } else {
                         return None;
                     };
                 )*
+                
                 Some(($($t,)*))
             }
-
             unsafe fn invoke<R: WasmResults>(
                 func: *const VMFunctionBody,
                 vmctx1: *mut VMOpaqueContext,

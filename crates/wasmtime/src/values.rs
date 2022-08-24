@@ -4,12 +4,13 @@ use crate::{AsContextMut, Func, ValType};
 use anyhow::{bail, Result};
 use std::ptr;
 use wasmtime_runtime::TableElement;
-
+use serde::{Deserialize, Serialize};
 pub use wasmtime_runtime::ValRaw;
 
 /// Possible runtime values that a WebAssembly module can either consume or
 /// produce.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "val")]
 pub enum Val {
     // NB: the ordering here is intended to match the ordering in
     // `ValType` to improve codegen when learning the type of a value.
@@ -38,6 +39,7 @@ pub enum Val {
     ///
     /// `FuncRef(None)` is the null function reference, created by `ref.null
     /// func` in Wasm.
+    #[serde(skip)]
     FuncRef(Option<Func>),
 
     /// An `externref` value which can hold opaque data to the Wasm instance
@@ -45,6 +47,7 @@ pub enum Val {
     ///
     /// `ExternRef(None)` is the null external reference, created by `ref.null
     /// extern` in Wasm.
+    #[serde(skip)]
     ExternRef(Option<ExternRef>),
 }
 
@@ -143,7 +146,7 @@ impl Val {
             ValType::FuncRef => Val::FuncRef(Func::from_raw(store, raw.get_funcref())),
         }
     }
-
+    
     accessors! {
         e
         (I32(i32) i32 unwrap_i32 *e)
@@ -183,6 +186,19 @@ impl Val {
     pub fn unwrap_externref(&self) -> Option<ExternRef> {
         self.externref().expect("expected externref")
     }
+
+    // pub fn unwrap(&self) -> impl WasmTy 
+    // {
+    //     match self.ty() {
+    //         ValType::I32 => {self.unwrap_i32()},
+    //         ValType::I64 => {self.unwrap_i64()},
+    //         ValType::F32 => {self.unwrap_f32();},
+    //         ValType::F64 => {self.unwrap_f64();},
+    //         ValType::FuncRef => {self.unwrap_funcref();},
+    //         ValType::V128 => {self.unwrap_v128();},
+    //         ValType::ExternRef => {self.externref().unwrap();}
+    //     }
+    // }
 
     pub(crate) fn into_table_element(
         self,

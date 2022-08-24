@@ -8,7 +8,7 @@ use anyhow::{anyhow, bail, Result};
 use std::mem;
 use std::ptr;
 use wasmtime_runtime::{self as runtime, InstanceHandle};
-
+use wasmtime_param_types::FuncParamRetTypes;
 // Externals
 
 /// An external item to a WebAssembly module, or a list of what can possibly be
@@ -126,6 +126,19 @@ impl Extern {
             wasmtime_runtime::Export::Table(t) => {
                 Extern::Table(Table::from_wasmtime_table(t, store))
             }
+        }
+    }
+
+    pub(crate) unsafe fn from_wasmtime_export_and_pr_type(
+        wasmtime_export: wasmtime_runtime::Export,
+        store: &mut StoreOpaque,
+        param_types: FuncParamRetTypes
+    ) -> Option<Extern> {
+        match wasmtime_export {
+            wasmtime_runtime::Export::Function(f) => {
+                Some(Extern::Func(Func::from_wasmtime_function_and_params_type(f, store, param_types)))
+            }
+            _ => None
         }
     }
 

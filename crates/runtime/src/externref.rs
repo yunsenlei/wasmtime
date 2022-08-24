@@ -1048,8 +1048,8 @@ mod tests {
             num_escaped_funcs: 0,
         });
         assert_eq!(
-            offsets.vm_extern_data_ref_count(),
-            actual_offset.try_into().unwrap(),
+            offsets.vm_extern_data_ref_count() as usize,
+            actual_offset,
         );
     }
 

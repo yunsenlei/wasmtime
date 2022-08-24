@@ -1201,6 +1201,7 @@ mod test {
                         runtime_info: &empty_runtime_info(module.clone()),
                         imports: Imports {
                             functions: &[],
+                            func_names: &[],
                             tables: &[],
                             memories: &[],
                             globals: &[],
@@ -1221,6 +1222,7 @@ mod test {
             runtime_info: &empty_runtime_info(module),
             imports: Imports {
                 functions: &[],
+                func_names: &[],
                 tables: &[],
                 memories: &[],
                 globals: &[],

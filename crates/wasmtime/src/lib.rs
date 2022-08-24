@@ -404,6 +404,7 @@ mod trampoline;
 mod trap;
 mod types;
 mod values;
+mod mem_values;
 
 pub use crate::config::*;
 pub use crate::engine::*;
@@ -421,6 +422,8 @@ pub use crate::store::{AsContext, AsContextMut, CallHook, Store, StoreContext, S
 pub use crate::trap::*;
 pub use crate::types::*;
 pub use crate::values::*;
+pub use crate::mem_values::*;
+pub use wasmtime_param_types::*;
 
 #[cfg(feature = "component-model")]
 pub mod component;

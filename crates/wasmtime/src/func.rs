@@ -1,9 +1,10 @@
-use crate::store::{StoreData, StoreOpaque, Stored};
+use crate::store::{StoreData, StoreOpaque, Stored, StoreInner};
 use crate::{
     AsContext, AsContextMut, CallHook, Engine, Extern, FuncType, Instance, StoreContext,
     StoreContextMut, Trap, Val, ValRaw, ValType,
 };
-use anyhow::{bail, Context as _, Result};
+use crate::mem_values::*;
+use anyhow::{bail, Context as _, Result, anyhow};
 use std::future::Future;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
@@ -16,7 +17,10 @@ use wasmtime_runtime::{
     VMCallerCheckedAnyfunc, VMContext, VMFunctionBody, VMFunctionImport, VMOpaqueContext,
     VMSharedSignatureIndex, VMTrampoline,
 };
-
+use wasmtime_param_types::*;
+use std::net::TcpStream;
+use fork::{fork, Fork};
+use std::io::{Read, Write};
 /// A WebAssembly function which can be called.
 ///
 /// This type can represent either an exported function from a WebAssembly
@@ -191,6 +195,7 @@ pub(crate) struct FuncData {
     // Also note that this is intentionally placed behind a pointer to keep it
     // small as `FuncData` instances are often inserted into a `Store`.
     ty: Option<Box<FuncType>>,
+    pr_ty: Option<FuncParamRetTypes>
 }
 
 /// The three ways that a function can be created and referenced from within a
@@ -343,6 +348,27 @@ impl Func {
             })
         }
     }
+    
+    /// Similar to Func::new, but create the Func with explicit parameter and return type
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub fn new_with_pr_type<T>(
+        mut store: impl AsContextMut<Data = T>,
+        ty: FuncType,
+        pr_ty: impl IntoIterator <Item = ParamRetType>,
+        func_name: &str,
+        func: impl Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<(), Trap> + Send + Sync + 'static,
+    ) -> Self{
+        let ty_clone = ty.clone();
+        let storage_idx = store.as_context_mut().0.store_data_mut().reserve_data_storage_for_func(func_name);
+        let pr_ty = FuncParamRetTypes::new_with_reserverd_storage(pr_ty, storage_idx, func_name);   
+        let pr_ty_clone = pr_ty.clone();
+        unsafe {
+            Func::new_unchecked_with_pr_type(store, ty, pr_ty, move |caller, values| {
+                Func::invoke_in_host(caller, &ty_clone, &pr_ty_clone, values, &func)
+            })
+        }
+    }
 
     /// Creates a new [`Func`] with the given arguments, although has fewer
     /// runtime checks than [`Func::new`].
@@ -372,6 +398,20 @@ impl Func {
         let store = store.as_context_mut().0;
         let host = HostFunc::new_unchecked(store.engine(), ty, func);
         host.into_func(store)
+    }
+
+    /// Similar to Func::new_unchecked, but with extra parameter type
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub unsafe fn new_unchecked_with_pr_type<T>(
+        mut store: impl AsContextMut<Data = T>,
+        ty: FuncType,
+        pr_ty: FuncParamRetTypes,
+        func: impl Fn(Caller<'_, T>, &mut [ValRaw]) -> Result<(), Trap> + Send + Sync + 'static,
+    ) -> Self {
+        let store = store.as_context_mut().0;
+        let host = HostFunc::new_unchecked(store.engine(), ty, func);
+        host.into_func_with_pr_type(store, pr_ty)
     }
 
     /// Creates a new host-defined WebAssembly function which, when called,
@@ -696,11 +736,20 @@ impl Func {
         let store = store.as_context_mut().0;
         // part of this unsafety is about matching the `T` to a `Store<T>`,
         // which is done through the `AsContextMut` bound above.
-        unsafe {
-            let host = HostFunc::wrap(store.engine(), func);
-            host.into_func(store)
+        if store.is_multi_process(){
+            unsafe {
+                let host = HostFunc::wrap2(store.engine(), func);
+                host.into_func(store)
+            }
+        }
+        else{
+            unsafe {
+                let host = HostFunc::wrap(store.engine(), func);
+                host.into_func(store)
+            }
         }
     }
+    
 
     for_each_function_signature!(generate_wrap_async_func);
 
@@ -746,7 +795,27 @@ impl Func {
     }
 
     pub(crate) fn sig_index(&self, data: &StoreData) -> VMSharedSignatureIndex {
-        data[self.0].sig_index()
+        data[self.0].sig_index() 
+    }
+    
+    /// Dispaly parameter's type that asoociated with the Func
+    pub fn display_param_types(&self, store: impl AsContext){
+        let store_data = store.as_context().0.store_data();
+        if store_data[self.0].pr_ty.is_some(){
+            println!("function parameter type:");
+            let pr_ty =  store_data[self.0].pr_ty.as_ref().unwrap();
+            pr_ty.display_param_types();
+            pr_ty.serialize_to_json();
+        }
+        else {
+            println!("Function's parameter type is empty");
+        }
+    }
+    
+    /// update a Func's FuncData in store with provided parameter type
+    pub fn update_params_type(&self, store: &mut StoreOpaque, pr_ty: FuncParamRetTypes){
+        let store_data = store.store_data_mut();
+        store_data[self.0].pr_ty = Some(pr_ty);
     }
 
     /// Invokes this function with the `params` given and writes returned values
@@ -775,6 +844,19 @@ impl Func {
         self.call_impl(&mut store.as_context_mut(), params, results)
     }
 
+    /// Spawn a new process and call the Wasm module
+    pub fn spawn_and_call(&self, instance: &Instance, mut store: impl AsContextMut) -> Result<()>{
+        match fork() {
+            Ok(Fork::Parent(_child)) => {
+                instance.handle_call_for_guest(&mut store)
+            },
+            Ok(Fork::Child) => {
+                println!("guest process call export function");
+                self.call(&mut store, &[], &mut[])
+            },
+            Err(_) => Err(anyhow!("failed to fork guest"))
+        }
+    }
     /// Invokes this function in an "unchecked" fashion, reading parameters and
     /// writing results to `params_and_returns`.
     ///
@@ -1003,8 +1085,25 @@ impl Func {
         Func::from_func_kind(FuncKind::StoreOwned { trampoline, export }, store)
     }
 
+    pub(crate) unsafe fn  from_wasmtime_function_and_params_type(
+        export: ExportFunction,
+        store: &mut StoreOpaque,
+        pr_ty: FuncParamRetTypes
+    ) -> Self {
+            let anyfunc = export.anyfunc.as_ref();
+            let trampoline = store.lookup_trampoline(&*anyfunc);
+            Func::from_func_kind_and_pr_type(FuncKind::StoreOwned { trampoline, export }, store, pr_ty)
+    }
+
     fn from_func_kind(kind: FuncKind, store: &mut StoreOpaque) -> Self {
-        Func(store.store_data_mut().insert(FuncData { kind, ty: None }))
+        Func(store.store_data_mut().insert(FuncData { kind, ty: None, pr_ty: None}))
+    }
+
+    fn from_func_kind_and_pr_type(
+        kind: FuncKind, 
+        store: &mut StoreOpaque, 
+        pr_ty: FuncParamRetTypes) -> Self{
+        Func(store.store_data_mut().insert(FuncData { kind, ty: None , pr_ty: Some(pr_ty)}))
     }
 
     pub(crate) fn vmimport(&self, store: &mut StoreOpaque) -> VMFunctionImport {
@@ -1036,6 +1135,7 @@ impl Func {
         // Note that we have a dynamic guarantee that `values_vec` is the
         // appropriate length to both read all arguments from as well as store
         // all results into.
+        println!("[invoke]");
         let mut val_vec = caller.store.0.take_hostcall_val_storage();
         debug_assert!(val_vec.is_empty());
         let nparams = ty.params().len();
@@ -1046,6 +1146,7 @@ impl Func {
 
         val_vec.extend((0..ty.results().len()).map(|_| Val::null()));
         let (params, results) = val_vec.split_at_mut(nparams);
+        
         func(caller.sub_caller(), params, results)?;
 
         // See the comment in `Func::call_impl`'s `write_params` function.
@@ -1085,7 +1186,190 @@ impl Func {
         caller.store.0.save_hostcall_val_storage(val_vec);
         Ok(())
     }
+    
+    /// invoke a host implemented function with provided values and type information
+    /// 
+    /// This method will not call the underlying function, but send context adn wait for return
+    fn invoke_in_host<T>(
+        mut caller: Caller<'_, T>,
+        ty: &FuncType,
+        pr_ty: &FuncParamRetTypes,
+        values_vec: &mut [ValRaw],
+        _func: &dyn Fn(Caller<'_, T>, &[Val], &mut [Val]) -> Result<(), Trap>,
+    ) -> Result<(), Trap> {
+        let mut val_vec = caller.store.0.take_hostcall_val_storage();
+        debug_assert!(val_vec.is_empty());
+        let nparams = ty.params().len();
+        val_vec.reserve(nparams + ty.results().len());
+        for (i, ty) in ty.params().enumerate() {
+            val_vec.push(unsafe { Val::from_raw(&mut caller.store, values_vec[i], ty) })
+        }
 
+        Func::prepare_data_for_func(&mut caller, pr_ty, val_vec.as_slice())?;
+        let index = pr_ty.index();
+        if index.is_none(){
+            return Err(Trap::new("faild to find storage for function"));
+        }
+        let index = index.unwrap();
+        let send_data = &caller.store.as_context().0.store_data().func_data()[index];
+
+        let mut stream = Func::connect_with_host("127.0.0.1:10000")?;
+        Func::send_data(&mut stream, &send_data)?;
+
+        val_vec.extend((0..ty.results().len()).map(|_| Val::null()));
+        let (_params, results) = val_vec.split_at_mut(nparams);
+
+        let data_storage = &mut caller.store.as_context_mut().0.store_data_mut().func_data_mut()[index];
+        let recv_data = Func::receive_data(&mut stream)?;
+        recv_data.unpack_to(data_storage);
+        
+        for (i, ret) in data_storage.ret_vals.iter().enumerate() {
+            results[i] = ret.clone();
+        }
+
+        // See the comment in `Func::call_impl`'s `write_params` function.
+        if ty.as_wasm_func_type().externref_returns_count()
+            > caller
+                .store
+                .0
+                .externref_activations_table()
+                .bump_capacity_remaining()
+        {
+            caller.store.gc();
+        }
+
+        // Unlike our arguments we need to dynamically check that the return
+        // values produced are correct. There could be a bug in `func` that
+        // produces the wrong number, wrong types, or wrong stores of
+        // values, and we need to catch that here.
+        for (i, (ret, ty)) in results.iter().zip(ty.results()).enumerate() {
+            if ret.ty() != ty {
+                return Err(Trap::new(
+                    "function attempted to return an incompatible value",
+                ));
+            }
+            if !ret.comes_from_same_store(caller.store.0) {
+                return Err(Trap::new(
+                    "cross-`Store` values are not currently supported",
+                ));
+            }
+            unsafe {
+                values_vec[i] = ret.to_raw(&mut caller.store);
+            }
+        }
+
+                // Restore our `val_vec` back into the store so it's usable for the next
+        // hostcall to reuse our own storage.
+        val_vec.truncate(0);
+        caller.store.0.save_hostcall_val_storage(val_vec);
+        Ok(())
+    }
+    
+    /// based on a function's FuncParamRetType and parameter values, create the structure for data sending
+    fn prepare_data_for_func<T>(caller: &mut Caller<'_, T>, pr_ty: &FuncParamRetTypes, params: &[Val]) -> Result<(), Trap> {
+        let index = pr_ty.index().unwrap();
+        let store = &mut caller.store;
+        let data_storage = &mut store.as_context_mut().0.store_data_mut().func_data_mut()[index];
+        
+        // First we simply copy the parameter values
+        data_storage.param_vals.clear();
+        for val in params{
+            data_storage.param_vals.push(val.clone());
+        }
+
+        let mem = match caller.get_export("memory") {
+            Some(Extern::Memory(mem)) => mem,
+            _ => return Err(Trap::new("failed to get guest memory")),
+        };
+
+        for b_ty in pr_ty.buffer_vec(){
+            match b_ty {
+                // for outbuffer, we need to copy data from memory
+                BufferType::WasmOut { ptr_idx, len_idx } => match (ptr_idx, len_idx){
+                    (Idx::ParamIdx(p), Idx::ParamIdx(l)) => {
+                        let ptr_param = match params[p.to_owned()] { 
+                            Val::I32(i) => i, 
+                            _ => {return Err(Trap::new("ptr val is not Val::I32"));}
+                        };
+                        let len_param = match params[l.to_owned()] { 
+                            Val::I32(i) => i, 
+                            _ => {return Err(Trap::new("len val is not Val::I32"));}
+                        };
+
+                        let data = mem.data(&caller)
+                        .get(ptr_param as  usize..)
+                        .and_then(|arr| arr.get(..len_param as usize)).unwrap().to_vec();
+
+                        let data_storage = &mut caller.store.0.store_data_mut().func_data_mut()[index];
+                        let param_buf = Buffer::new(ptr_idx.to_owned(), len_idx.to_owned(), data);
+                        data_storage.param_bufs.push(param_buf);
+
+                    },
+                    // we skip other combination of index. For return value's index, we skip because we don't have the value yet
+                    _ => {}
+                },
+                // for in-buffer, there is no data to copy yet
+                BufferType::WasmIn { ptr_idx, len_idx } => match (ptr_idx, len_idx){
+                    (Idx::ParamIdx(p), Idx::ParamIdx(l)) => {
+                        let _ptr_param = match params[p.to_owned()] { 
+                            Val::I32(i) => i, 
+                            _ => {return Err(Trap::new("ptr val is not Val::I32"));}
+                        };
+                        let _len_param = match params[l.to_owned()] { 
+                            Val::I32(i) => i, 
+                            _ => {return Err(Trap::new("len val is not Val::I32"));}
+                        };
+                        let data_storage = &mut caller.store.0.store_data_mut().func_data_mut()[index];
+                        let param_buf = Buffer::new_empty(ptr_idx.to_owned(), len_idx.to_owned());
+                        data_storage.param_bufs.push(param_buf);
+                    },
+                    _ => {}
+                }
+            }   
+        }
+
+        Ok(())
+    }
+
+    /// connect with host 
+    pub fn connect_with_host(address: &str) -> Result<TcpStream, Trap>{
+        match TcpStream::connect(address) {
+            Ok(stream) => {
+                Ok(stream)
+            }
+            Err(e) => {return Err(Trap::new(format!("Failed to connect with host {}", e)));}
+        }
+    }
+
+    /// send serialized ParamRetData to host
+    pub fn send_data(stream: &mut TcpStream, send_data: &ParamRetData) -> Result<(), Trap>{
+        if let Ok(ser_data) =  serde_json::to_string(send_data){
+            stream.write(ser_data.as_bytes()).unwrap();
+            Ok(()) 
+            }
+        
+        else {
+            return Err(Trap::new("Failed to serialize send data"));
+        }
+    }
+
+    /// receive data and unpack it into a ParamRetData structure
+    pub fn receive_data(stream: &mut TcpStream) -> Result<ParamRetData, Trap> {
+        let mut recv_data = [0 as u8; 1024];
+        if let Ok(data_len) = stream.read(&mut recv_data){
+            if let Ok(param_ret_data)= serde_json::from_slice::<'_, ParamRetData>(&recv_data[..data_len]){
+                Ok(param_ret_data)               
+            }
+            else{
+                return Err(Trap::new("Failed to deserialize data"));
+            }
+        }
+        else{
+            return Err(Trap::new("Failed to read return data from host"));
+        }
+    }
+
+    
     /// Attempts to extract a typed object from this `Func` through which the
     /// function can be called.
     ///
@@ -1245,6 +1529,30 @@ pub(crate) fn invoke_wasm_and_catch_traps<T>(
     }
 }
 
+pub(crate) fn invoke_wasm_and_catch_traps2<T>(
+    store: &mut StoreContextMut<'_, T>,
+    closure: impl FnMut(*mut VMContext),
+) -> Result<(), Trap> {
+    unsafe {
+        println!("[invoke_wasm_and_catch_traps]");
+        // let exit = enter_wasm(store);
+
+        // if let Err(trap) = store.0.call_hook(CallHook::CallingWasm) {
+        //     exit_wasm(store, exit);
+        //     return Err(trap);
+        // }
+        let result = wasmtime_runtime::catch_traps(
+            store.0.signal_handler(),
+            store.0.engine().config().wasm_backtrace,
+            store.0.default_callee(),
+            closure,
+        );
+        // exit_wasm(store, exit);
+        // store.0.call_hook(CallHook::ReturningFromWasm)?;
+        result.map_err(Trap::from_runtime_box)
+    }
+}
+
 /// This function is called to register state within `Store` whenever
 /// WebAssembly is entered within the `Store`.
 ///
@@ -1393,6 +1701,8 @@ pub unsafe trait WasmRet {
     fn into_fallible(self) -> Self::Fallible;
     #[doc(hidden)]
     fn fallible_from_trap(trap: Trap) -> Self::Fallible;
+    #[doc(hidden)]
+    unsafe fn from_slice(val_vec: &[Val], store: impl AsContextMut) -> Self;
 }
 
 unsafe impl<T> WasmRet for T
@@ -1430,6 +1740,15 @@ where
     fn fallible_from_trap(trap: Trap) -> Result<T, Trap> {
         Err(trap)
     }
+
+    unsafe fn from_slice(val_vec: &[Val], mut store: impl AsContextMut) -> Self {
+        let mut iter = val_vec.iter(); 
+        let val = iter.next().unwrap();
+        let mut raw = val.to_raw(&mut store);
+        let ret = T::abi_from_raw(&mut raw as *mut ValRaw);
+        Self::from_abi(ret, store.as_context_mut().0)
+    }
+
 }
 
 unsafe impl<T> WasmRet for Result<T, Trap>
@@ -1470,6 +1789,11 @@ where
     fn fallible_from_trap(trap: Trap) -> Result<T, Trap> {
         Err(trap)
     }
+
+    unsafe fn from_slice(_val_vec: &[Val], _store: impl AsContextMut)-> Self {
+        unimplemented!("from_slice unimplemented");
+    }
+
 }
 
 macro_rules! impl_wasm_host_results {
@@ -1522,6 +1846,19 @@ macro_rules! impl_wasm_host_results {
             fn fallible_from_trap(trap: Trap) -> Result<Self, Trap> {
                 Err(trap)
             }
+
+            unsafe fn from_slice(val_vec: &[Val], mut store: impl AsContextMut) -> Self{
+                let mut iter = val_vec.iter();
+                $(
+                    let val = iter.next().unwrap();
+                    let mut raw = val.to_raw(&mut store);
+                    let $t = $t::abi_from_raw(&mut raw as *mut ValRaw);
+                )*
+                iter.next();
+                let ret = ($($t,)*);
+                Self::from_abi(store.as_context_mut().0, ret)
+            }
+          
         }
     )
 }
@@ -1643,6 +1980,14 @@ for_each_function_signature!(impl_host_abi);
 pub trait IntoFunc<T, Params, Results>: Send + Sync + 'static {
     #[doc(hidden)]
     fn into_func(self, engine: &Engine) -> (InstanceHandle, VMTrampoline);
+    #[doc(hidden)]
+    fn into_func_in_host(self, engine: &Engine) -> (InstanceHandle, VMTrampoline);
+}
+
+/// Same as IntoFunc, except we don't call the function in current process but forward the parameter and data into a host process where the call actually happens
+pub trait IntoFuncInHost <T, Params, Results>: Send + Sync + 'static {
+    #[doc(hidden)]
+    fn into_func_in_host(self, engine: &Engine) -> (InstanceHandle, VMTrampoline);
 }
 
 /// A structure representing the caller's context when creating a function
@@ -1685,6 +2030,56 @@ impl<T> Caller<'_, T> {
         Caller {
             store: self.store.as_context_mut(),
             caller: self.caller,
+        }
+    }
+
+    /// get the mutable reference to data for current executing function
+    pub fn pull_current_func_data_mut(& mut self) -> &mut ParamRetData{
+        let store = self.store.as_context().0;
+        let index = store.get_host_stack();
+        
+        // reborrow as mutable
+        let store = self.store.as_context_mut().0;
+        &mut store.store_data_mut().func_data_mut()[index]
+    }
+
+    /// get the data for current executing function
+    pub fn pull_current_func_data(& mut self) -> &ParamRetData{
+        let store = self.store.as_context().0;
+        let index = store.get_host_stack();
+        &store.store_data().func_data()[index]
+    }
+
+
+    /// get instance associated with the caller
+    pub fn get_instance(&self){
+        let instance = self.caller;
+        let pr_index = instance.module().pr_type_indexes.get("log_str").unwrap().to_owned();
+        let pr_ty = instance.module().func_pr_types.get(pr_index).unwrap();
+        println!("{:?}", pr_ty);
+        let exports = instance.exports();
+        for export in exports {
+            println!("{:?}", export);
+        }
+    }
+    
+    /// retrieve the function's FuncParamRetType from its vmctx
+    pub fn get_func_pr_type_from_vmctx(&self, vmctx: *mut VMOpaqueContext) ->Result<&FuncParamRetTypes, ()> {
+        let instance  = self.caller;
+        let func_name = instance.get_func_name_from_vmctx(vmctx);
+        match func_name {
+            Ok(func_name) => {
+                if let Some(pr_index) = instance.module().pr_type_indexes.get(func_name.as_str()){
+                    let pr_ty = instance.module().func_pr_types.get(pr_index.clone()).unwrap();
+                    Ok(pr_ty)
+                }
+                else{
+                    Err(())
+                }
+            }
+            Err(_) => {
+                Err(())
+            }
         }
     }
 
@@ -1834,6 +2229,15 @@ macro_rules! impl_into_func {
 
                 f.into_func(engine)
             }
+
+            fn into_func_in_host(self, engine: &Engine) -> (InstanceHandle, VMTrampoline) {
+                let f = move |_: Caller<'_, T>, $($args:$args),*| {
+                    self($($args,)*)
+                };
+
+                f.into_func_in_host(engine)
+            }
+            
         }
 
         #[allow(non_snake_case)]
@@ -1994,12 +2398,594 @@ macro_rules! impl_into_func {
 
                 (instance, trampoline)
             }
+
+            fn into_func_in_host(self, engine: &Engine) -> (InstanceHandle, VMTrampoline) {
+                /// This shim is called by Wasm code, constructs a `Caller`,
+                /// calls the wrapped host function, and returns the translated
+                /// result back to Wasm.
+                ///
+                /// Note that this shim's ABI must *exactly* match that expected
+                /// by Cranelift, since Cranelift is generating raw function
+                /// calls directly to this function.
+                /// 
+                unsafe extern "C" fn wasm_to_host_shim<T, F, $($args,)* R>(
+                    vmctx: *mut VMOpaqueContext,
+                    caller_vmctx: *mut VMContext,
+                    $( $args: $args::Abi, )*
+                    retptr: R::Retptr,
+                ) -> R::Abi
+                where
+                    F: Fn(Caller<'_, T>, $( $args ),*) -> R + 'static,
+                    $( $args: WasmTy, )*
+                    R: WasmRet,
+                {
+                    enum CallResult<U> {
+                        Ok(U),
+                        Trap(anyhow::Error),
+                        Panic(Box<dyn std::any::Any + Send>),
+                    }
+                    // Note that this `result` is intentionally scoped into a
+                    // separate block. Handling traps and panics will involve
+                    // longjmp-ing from this function which means we won't run
+                    // destructors. As a result anything requiring a destructor
+                    // should be part of this block, and the long-jmp-ing
+                    // happens after the block in handling `CallResult`.
+                    let result = Caller::with(caller_vmctx, |mut caller| {
+                        let pr_ty_clone: Option<FuncParamRetTypes>;
+                        if let Ok(pr_ty) = caller.get_func_pr_type_from_vmctx(vmctx){
+                            pr_ty_clone = Some(pr_ty.clone());
+                        }
+                        else {
+                            pr_ty_clone = None;
+                        }
+
+                        
+                        let vmctx = VMContext::from_opaque(vmctx);
+                        let state = (*vmctx).host_state();
+                        // Double-check ourselves in debug mode, but we control
+                        // the `Any` here so an unsafe downcast should also
+                        // work.
+                        debug_assert!(state.is::<F>());
+                        let func = &*(state as *const _ as *const F);
+
+                        match pr_ty_clone {
+                            Some(pr_ty_clone) => {
+                                let ret = {
+                                    panic::catch_unwind(AssertUnwindSafe(|| {
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::CallingHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+                                        // create a value vector to store each $arg
+                                        let mut val_vec = Vec::<Val>::new();
+                                        val_vec.reserve($num);
+        
+                                        $(
+                                            match $args::valtype() {
+                                                ValType::I32 => {
+                                                    let mut raw = ValRaw::i32(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::I64 => {
+                                                    let mut raw = ValRaw::i64(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::F32 => {
+                                                    let mut raw = ValRaw::u32(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::F64 => {
+                                                    let mut raw = ValRaw::u64(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::V128 => {
+                                                    let mut raw = ValRaw::v128(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::ExternRef => {
+                                                    let mut raw = ValRaw::externref(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::FuncRef => {
+                                                    let mut raw = ValRaw::funcref(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                }
+        
+                                            }
+                                            let $args = $args::from_abi($args, caller.store.0);  
+                                        )*
+                                        
+                                        if let Err(trap) = Func::prepare_data_for_func(&mut caller, &pr_ty_clone, val_vec.as_slice()){
+                                            return R::fallible_from_trap(trap);
+                                        }
+
+                                        let index = pr_ty_clone.index().unwrap();
+                                        let data_storage = &caller.store.as_context().0.store_data().func_data()[index];
+                                        println!("[wasm_to_host_shim] prepare data to send {:?}", data_storage);
+                                        let mut stream = Func::connect_with_host("127.0.0.1:10000").unwrap();
+        
+                                        if let Err(trap) = Func::send_data(&mut stream, &data_storage){
+                                            return R::fallible_from_trap(trap);
+                                        }
+
+                                        let mut ret_vec = Vec::<Val>::new();
+                                        {
+                                            let data_storage = &mut caller.store.as_context_mut().0.store_data_mut().func_data_mut()[index];
+                                            if let Ok(recv_data) = Func::receive_data(&mut stream){
+                                                recv_data.unpack_to(data_storage);
+                                            }
+                                            for ret in &data_storage.ret_vals {
+                                                ret_vec.push(ret.clone());
+                                            }
+                                            println!("[wasm_to_host_shim] receive data from host: {:?}", data_storage);
+                                        }
+                                        let r = R::from_slice(ret_vec.as_slice(), &mut caller.store);
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::ReturningFromHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+                                        r.into_fallible()
+                                                                      
+                                    }))
+                                };
+                                match ret {
+                                    Err(panic) => CallResult::Panic(panic),
+                                    Ok(ret) => {
+                                        // Because the wrapped function is not `unsafe`, we
+                                        // can't assume it returned a value that is
+                                        // compatible with this store.
+                                        if !ret.compatible_with_store(caller.store.0) {
+                                            CallResult::Trap(anyhow::anyhow!("host function attempted to return cross-`Store` value to Wasm"))
+                                        } else {
+                                            match ret.into_abi_for_ret(caller.store.0, retptr) {
+                                                Ok(val) => CallResult::Ok(val),
+                                                Err(trap) => CallResult::Trap(trap.into()),
+                                            }
+                                        }
+        
+                                    }
+                                }
+
+                            }
+
+                            None => {
+                                let ret = {
+                                    panic::catch_unwind(AssertUnwindSafe(|| {
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::CallingHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+                                        $(
+                                            let $args = $args::from_abi($args, caller.store.0);  
+                                        )*
+    
+                                        let r = func(
+                                            caller.sub_caller(),                                    
+                                            $( $args, )*
+                                        );
+                                             
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::ReturningFromHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+        
+                                        r.into_fallible()
+                                       
+           
+                                    }))
+                                };
+
+                                match ret {
+                                    Err(panic) => CallResult::Panic(panic),
+                                    Ok(ret) => {
+                                        // Because the wrapped function is not `unsafe`, we
+                                        // can't assume it returned a value that is
+                                        // compatible with this store.
+                                        if !ret.compatible_with_store(caller.store.0) {
+                                            CallResult::Trap(anyhow::anyhow!("host function attempted to return cross-`Store` value to Wasm"))
+                                        } else {
+                                            match ret.into_abi_for_ret(caller.store.0, retptr) {
+                                                Ok(val) => CallResult::Ok(val),
+                                                Err(trap) => CallResult::Trap(trap.into()),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                    });
+
+                    match result {
+                        CallResult::Ok(val) => val,
+                        CallResult::Trap(trap) => raise_user_trap(trap),
+                        CallResult::Panic(panic) => wasmtime_runtime::resume_panic(panic),
+                    }
+                }
+
+                /// This trampoline allows host code to indirectly call the
+                /// wrapped function (e.g. via `Func::call` on a `funcref` that
+                /// happens to reference our wrapped function).
+                ///
+                /// It reads the arguments out of the incoming `args` array,
+                /// calls the given function pointer, and then stores the result
+                /// back into the `args` array.
+                unsafe extern "C" fn host_trampoline<$($args,)* R>(
+                    callee_vmctx: *mut VMOpaqueContext,
+                    caller_vmctx: *mut VMContext,
+                    ptr: *const VMFunctionBody,
+                    args: *mut ValRaw,
+                )
+                where
+                    $($args: WasmTy,)*
+                    R: WasmRet,
+                {
+                    let ptr = mem::transmute::<
+                        *const VMFunctionBody,
+                        unsafe extern "C" fn(
+                            *mut VMOpaqueContext,
+                            *mut VMContext,
+                            $( $args::Abi, )*
+                            R::Retptr,
+                        ) -> R::Abi,
+                    >(ptr);
+
+                    let mut _n = 0;
+                    $(
+                        let $args = $args::abi_from_raw(args.add(_n));
+                        _n += 1;
+                    )*
+                    R::wrap_trampoline(args, |retptr| {
+                        ptr(callee_vmctx, caller_vmctx, $( $args, )* retptr)
+                    });
+                }
+
+                let ty = R::func_type(
+                    None::<ValType>.into_iter()
+                        $(.chain(Some($args::valtype())))*
+                );
+
+                let shared_signature_id = engine.signatures().register(ty.as_wasm_func_type());
+
+                let trampoline = host_trampoline::<$($args,)* R>;
+
+
+                let instance = unsafe {
+                    crate::trampoline::create_raw_function(
+                        std::slice::from_raw_parts_mut(
+                            wasm_to_host_shim::<T, F, $($args,)* R> as *mut _,
+                            0,
+                        ),
+                        shared_signature_id,
+                        Box::new(self),
+                    )
+                    .expect("failed to create raw function")
+                };
+                
+                (instance, trampoline)
+            }
         }
     }
 }
 
 for_each_function_signature!(impl_into_func);
 
+/// Mostly the same as impl_into_func, except the wasm_to_host_shim will collect parameter value and data into our
+macro_rules! impl_into_func_in_host {
+    ($num:tt $($args:ident)*) => {
+        #[allow(non_snake_case)]
+        impl<T, F, $($args,)* R> IntoFuncInHost<T, ($($args,)*), R> for F
+        where
+            F: Fn($($args,)*) -> R + Send + Sync + 'static,
+            $($args: WasmTy + std::fmt::Debug,)*
+            R: WasmRet + std::fmt::Debug,
+        {
+            fn into_func_in_host(self, engine: &Engine) -> (InstanceHandle, VMTrampoline) {
+                let f = move |_: Caller<'_, T>, $($args:$args),*| {
+                    self($($args,)*)
+                };
+
+                f.into_func_in_host(engine)
+            }
+        }
+
+        #[allow(non_snake_case)]
+        impl<T, F, $($args,)* R> IntoFuncInHost<T, (Caller<'_, T>, $($args,)*), R> for F
+        where
+            F: Fn(Caller<'_, T>, $($args),*) -> R + Send + Sync + 'static,
+            $($args: WasmTy + std::fmt::Debug,)*
+            R: WasmRet + std::fmt::Debug,
+        {
+            fn into_func_in_host(self, engine: &Engine) -> (InstanceHandle, VMTrampoline) {
+                /// This shim is called by Wasm code, constructs a `Caller`,
+                /// calls the wrapped host function, and returns the translated
+                /// result back to Wasm.
+                ///
+                /// Note that this shim's ABI must *exactly* match that expected
+                /// by Cranelift, since Cranelift is generating raw function
+                /// calls directly to this function.
+                /// 
+                unsafe extern "C" fn wasm_to_host_shim<T, F, $($args,)* R>(
+                    vmctx: *mut VMOpaqueContext,
+                    caller_vmctx: *mut VMContext,
+                    $( $args: $args::Abi, )*
+                    retptr: R::Retptr,
+                ) -> R::Abi
+                where
+                    F: Fn(Caller<'_, T>, $( $args ),*) -> R + 'static,
+                    $( $args: WasmTy + std::fmt::Debug, )*
+                    R: WasmRet,
+                {
+                    enum CallResult<U> {
+                        Ok(U),
+                        Trap(anyhow::Error),
+                        Panic(Box<dyn std::any::Any + Send>),
+                    }
+                    // Note that this `result` is intentionally scoped into a
+                    // separate block. Handling traps and panics will involve
+                    // longjmp-ing from this function which means we won't run
+                    // destructors. As a result anything requiring a destructor
+                    // should be part of this block, and the long-jmp-ing
+                    // happens after the block in handling `CallResult`.
+                    let result = Caller::with(caller_vmctx, |mut caller| {
+                        let pr_ty_clone: Option<FuncParamRetTypes>;
+                        if let Ok(pr_ty) = caller.get_func_pr_type_from_vmctx(vmctx){
+                            pr_ty_clone = Some(pr_ty.clone());
+                        }
+                        else {
+                            pr_ty_clone = None;
+                        }
+
+                        
+                        let vmctx = VMContext::from_opaque(vmctx);
+                        let state = (*vmctx).host_state();
+                        // Double-check ourselves in debug mode, but we control
+                        // the `Any` here so an unsafe downcast should also
+                        // work.
+                        debug_assert!(state.is::<F>());
+                        let func = &*(state as *const _ as *const F);
+
+                        match pr_ty_clone {
+                            Some(pr_ty_clone) => {
+                                let ret = {
+                                    panic::catch_unwind(AssertUnwindSafe(|| {
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::CallingHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+                                        // create a value vector to store each $arg
+                                        let mut val_vec = Vec::<Val>::new();
+                                        val_vec.reserve($num);
+        
+                                        $(
+                                            match $args::valtype() {
+                                                ValType::I32 => {
+                                                    let mut raw = ValRaw::i32(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::I64 => {
+                                                    let mut raw = ValRaw::i64(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::F32 => {
+                                                    let mut raw = ValRaw::u32(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::F64 => {
+                                                    let mut raw = ValRaw::u64(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::V128 => {
+                                                    let mut raw = ValRaw::v128(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::ExternRef => {
+                                                    let mut raw = ValRaw::externref(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                },
+                                                ValType::FuncRef => {
+                                                    let mut raw = ValRaw::funcref(0);
+                                                    $args::abi_into_raw($args, &mut raw as *mut ValRaw);
+                                                    let val = Val::from_raw(&mut caller.store, raw, $args::valtype());
+                                                    val_vec.push(val);
+                                                }
+        
+                                            }
+                                            let $args = $args::from_abi($args, caller.store.0);  
+                                        )*
+                                        
+                                        if let Err(trap) = Func::prepare_data_for_func(&mut caller, &pr_ty_clone, val_vec.as_slice()){
+                                            return R::fallible_from_trap(trap);
+                                        }
+
+                                        let index = pr_ty_clone.index().unwrap();
+                                        let data_storage = &caller.store.as_context().0.store_data().func_data()[index];
+                                        println!("[wasm_to_host_shim] prepare data to send {:?}", data_storage);
+                                        let mut stream = Func::connect_with_host("127.0.0.1:10000").unwrap();
+        
+                                        if let Err(trap) = Func::send_data(&mut stream, &data_storage){
+                                            return R::fallible_from_trap(trap);
+                                        }
+
+                                        let mut ret_vec = Vec::<Val>::new();
+                                        {
+                                            let data_storage = &mut caller.store.as_context_mut().0.store_data_mut().func_data_mut()[index];
+                                            if let Ok(recv_data) = Func::receive_data(&mut stream){
+                                                recv_data.unpack_to(data_storage);
+                                            }
+                                            for ret in &data_storage.ret_vals {
+                                                ret_vec.push(ret.clone());
+                                            }
+                                            println!("[wasm_to_host_shim] receive data from host: {:?}", data_storage);
+                                        }
+                                        let r = R::from_slice(ret_vec.as_slice(), &mut caller.store);
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::ReturningFromHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+                                        r.into_fallible()
+                                                                      
+                                    }))
+                                };
+                                match ret {
+                                    Err(panic) => CallResult::Panic(panic),
+                                    Ok(ret) => {
+                                        // Because the wrapped function is not `unsafe`, we
+                                        // can't assume it returned a value that is
+                                        // compatible with this store.
+                                        if !ret.compatible_with_store(caller.store.0) {
+                                            CallResult::Trap(anyhow::anyhow!("host function attempted to return cross-`Store` value to Wasm"))
+                                        } else {
+                                            match ret.into_abi_for_ret(caller.store.0, retptr) {
+                                                Ok(val) => CallResult::Ok(val),
+                                                Err(trap) => CallResult::Trap(trap.into()),
+                                            }
+                                        }
+        
+                                    }
+                                }
+
+                            }
+
+                            None => {
+                                let ret = {
+                                    panic::catch_unwind(AssertUnwindSafe(|| {
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::CallingHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+                                        $(
+                                            let $args = $args::from_abi($args, caller.store.0);  
+                                        )*
+    
+                                        let r = func(
+                                            caller.sub_caller(),                                    
+                                            $( $args, )*
+                                        );
+                                             
+                                        if let Err(trap) = caller.store.0.call_hook(CallHook::ReturningFromHost) {
+                                            return R::fallible_from_trap(trap);
+                                        }
+        
+                                        r.into_fallible()
+                                       
+           
+                                    }))
+                                };
+
+                                match ret {
+                                    Err(panic) => CallResult::Panic(panic),
+                                    Ok(ret) => {
+                                        // Because the wrapped function is not `unsafe`, we
+                                        // can't assume it returned a value that is
+                                        // compatible with this store.
+                                        if !ret.compatible_with_store(caller.store.0) {
+                                            CallResult::Trap(anyhow::anyhow!("host function attempted to return cross-`Store` value to Wasm"))
+                                        } else {
+                                            match ret.into_abi_for_ret(caller.store.0, retptr) {
+                                                Ok(val) => CallResult::Ok(val),
+                                                Err(trap) => CallResult::Trap(trap.into()),
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                    });
+
+                    match result {
+                        CallResult::Ok(val) => val,
+                        CallResult::Trap(trap) => raise_user_trap(trap),
+                        CallResult::Panic(panic) => wasmtime_runtime::resume_panic(panic),
+                    }
+                }
+
+                /// This trampoline allows host code to indirectly call the
+                /// wrapped function (e.g. via `Func::call` on a `funcref` that
+                /// happens to reference our wrapped function).
+                ///
+                /// It reads the arguments out of the incoming `args` array,
+                /// calls the given function pointer, and then stores the result
+                /// back into the `args` array.
+                unsafe extern "C" fn host_trampoline<$($args,)* R>(
+                    callee_vmctx: *mut VMOpaqueContext,
+                    caller_vmctx: *mut VMContext,
+                    ptr: *const VMFunctionBody,
+                    args: *mut ValRaw,
+                )
+                where
+                    $($args: WasmTy,)*
+                    R: WasmRet,
+                {
+                    let ptr = mem::transmute::<
+                        *const VMFunctionBody,
+                        unsafe extern "C" fn(
+                            *mut VMOpaqueContext,
+                            *mut VMContext,
+                            $( $args::Abi, )*
+                            R::Retptr,
+                        ) -> R::Abi,
+                    >(ptr);
+
+                    let mut _n = 0;
+                    $(
+                        let $args = $args::abi_from_raw(args.add(_n));
+                        _n += 1;
+                    )*
+                    R::wrap_trampoline(args, |retptr| {
+                        ptr(callee_vmctx, caller_vmctx, $( $args, )* retptr)
+                    });
+                }
+
+                let ty = R::func_type(
+                    None::<ValType>.into_iter()
+                        $(.chain(Some($args::valtype())))*
+                );
+
+                let shared_signature_id = engine.signatures().register(ty.as_wasm_func_type());
+
+                let trampoline = host_trampoline::<$($args,)* R>;
+
+
+                let instance = unsafe {
+                    crate::trampoline::create_raw_function(
+                        std::slice::from_raw_parts_mut(
+                            wasm_to_host_shim::<T, F, $($args,)* R> as *mut _,
+                            0,
+                        ),
+                        shared_signature_id,
+                        Box::new(self),
+                    )
+                    .expect("failed to create raw function")
+                };
+                
+                (instance, trampoline)
+            }
+        }
+    }
+}
+
+// for_each_function_signature!(impl_into_func_in_host);
 /// Representation of a host-defined function.
 ///
 /// This is used for `Func::new` but also for `Linker`-defined functions. For
@@ -2069,6 +3055,15 @@ impl HostFunc {
         let (instance, trampoline) = func.into_func(engine);
         HostFunc::_new(engine, instance, trampoline)
     }
+    
+    /// the same as wrap, except the func implement IntoFuncInHost
+    pub fn wrap2<T, Params, Results>(
+        engine: &Engine,
+        func: impl IntoFunc<T, Params, Results>,
+    ) -> Self {
+        let (instance, trampoline) = func.into_func_in_host(engine);
+        HostFunc::_new(engine, instance, trampoline)
+    }
 
     /// Requires that this function's signature is already registered within
     /// `Engine`. This happens automatically during the above two constructors.
@@ -2118,10 +3113,26 @@ impl HostFunc {
         Func::from_func_kind(FuncKind::RootedHost(RootedHostFunc::new(self)), store)
     }
 
+    pub unsafe fn to_func_store_rooted_with_param_type(self: &Arc<Self>, params_type: FuncParamRetTypes, store: &mut StoreOpaque) -> Func {
+        self.validate_store(store);
+        Func::from_func_kind_and_pr_type(
+            FuncKind::RootedHost(RootedHostFunc::new(self)), 
+            store, 
+            params_type)
+    }
+
     /// Same as [`HostFunc::to_func`], different ownership.
     unsafe fn into_func(self, store: &mut StoreOpaque) -> Func {
         self.validate_store(store);
         Func::from_func_kind(FuncKind::Host(Box::new(self)), store)
+    }
+
+    unsafe fn into_func_with_pr_type(
+        self, 
+        store: &mut StoreOpaque, 
+        pr_ty: FuncParamRetTypes) -> Func {
+            self.validate_store(store);
+            Func::from_func_kind_and_pr_type(FuncKind::Host(Box::new(self)), store, pr_ty) 
     }
 
     fn validate_store(&self, store: &mut StoreOpaque) {

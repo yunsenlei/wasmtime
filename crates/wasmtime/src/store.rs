@@ -291,6 +291,10 @@ pub struct StoreOpaque {
     memory_limit: usize,
     table_count: usize,
     table_limit: usize,
+
+    /// A configuration value to distinguish whether this is for multi-process model
+    multi_process: bool,
+
     /// An adjustment to add to the fuel consumed value in `runtime_limits` above
     /// to get the true amount of fuel consumed.
     fuel_adj: i64,
@@ -313,7 +317,7 @@ pub struct StoreOpaque {
     /// Same as `hostcall_val_storage`, but for the direction of the host
     /// calling wasm.
     wasm_val_raw_storage: Vec<ValRaw>,
-
+    host_stack: Vec<usize>, 
     /// A list of lists of definitions which have been used to instantiate
     /// within this `Store`.
     ///
@@ -486,6 +490,7 @@ impl<T> Store<T> {
                 table_count: 0,
                 table_limit: crate::DEFAULT_TABLE_LIMIT,
                 fuel_adj: 0,
+                multi_process: false,
                 #[cfg(feature = "async")]
                 async_state: AsyncState {
                     current_suspend: UnsafeCell::new(ptr::null()),
@@ -496,6 +501,7 @@ impl<T> Store<T> {
                 default_callee,
                 hostcall_val_storage: Vec::new(),
                 wasm_val_raw_storage: Vec::new(),
+                host_stack: Vec::new(),
                 rooted_host_funcs: ManuallyDrop::new(Vec::new()),
             },
             limiter: None,
@@ -520,6 +526,11 @@ impl<T> Store<T> {
         Self {
             inner: ManuallyDrop::new(inner),
         }
+    }
+
+    /// modifiy the multi_process configuration of the store
+    pub fn set_multi_process(&mut self) {
+        self.inner.multi_process = true;
     }
 
     /// Access the underlying data owned by this `Store`.
@@ -567,6 +578,22 @@ impl<T> Store<T> {
         }
     }
 
+    /// reserve the func storage given a function's name
+    pub fn reserve_func_storage(&mut self, func_name: &str) -> usize{
+        self.as_context_mut().0.store_data_mut().reserve_data_storage_for_func(func_name)
+    }
+
+    /// iterate an store's associated instance's exports
+    pub fn iterate_instance_export(&self) {
+        let store = self.as_context().0;
+        for instance in &store.instances{
+            println!("instance {:?}", instance.ondemand);
+            let exports = instance.handle.exports();
+            for (k, v) in exports {
+                println!("key: {}, index value: {:?}", k, v);
+            }
+        }
+    }
     /// Configures the [`ResourceLimiter`] used to limit resource creation
     /// within this [`Store`].
     ///
@@ -1102,6 +1129,11 @@ impl<T> StoreInner<T> {
             None => Ok(()),
         }
     }
+
+    pub fn is_multi_process(&self)-> bool {
+        println!("{}", self.multi_process);
+        self.multi_process
+    }
 }
 
 impl StoreOpaque {
@@ -1487,6 +1519,20 @@ impl StoreOpaque {
 
     pub(crate) fn push_rooted_funcs(&mut self, funcs: Arc<[Definition]>) {
         self.rooted_host_funcs.push(funcs);
+    }
+
+    pub fn get_host_stack(&self) -> usize {
+        self.host_stack.last().unwrap().to_owned()
+    }
+
+    pub fn push_host_stack(&mut self, v: usize) -> usize {
+        let index = self.host_stack.len();
+        self.host_stack.push(v);
+        index
+    }
+
+    pub fn pop_host_stack(&mut self) {
+        self.host_stack.pop();
     }
 }
 

@@ -21,7 +21,7 @@ use wasmtime_jit::{CompiledModule, CompiledModuleInfo};
 use wasmtime_runtime::{
     CompiledModuleId, MemoryImage, MmapVec, ModuleMemoryImages, VMSharedSignatureIndex,
 };
-
+use wasmtime_param_types::*;
 mod registry;
 mod serialization;
 
@@ -195,6 +195,19 @@ impl Module {
         Self::from_binary(engine, &bytes)
     }
 
+    /// Same as method 'new', with extra parameter type information
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub fn new_with_pr_types(
+        engine: &Engine, 
+        bytes: impl AsRef<[u8]>,
+        func_pr_types: &FuncPRTypeCollection) -> Result<Module> {
+        let bytes = bytes.as_ref();
+        #[cfg(feature = "wat")]
+        let bytes = wat::parse_bytes(bytes)?;
+        Self::from_binary_with_pr_types(engine, &bytes, func_pr_types)
+    }
+
     /// Creates a new WebAssembly `Module` from the contents of the given
     /// `file` on disk.
     ///
@@ -245,6 +258,32 @@ impl Module {
         }
     }
 
+    /// Similar to from_file, but with an extra argument as a collection of parameter types for a module's exported functions
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub fn from_file_with_pr_types(
+        engine: &Engine, 
+        file: impl AsRef<Path>,
+        func_pr_types: &FuncPRTypeCollection) -> Result<Module> {
+        match Self::new_with_pr_types(
+            engine,
+            &fs::read(&file).with_context(|| "failed to read input file")?,
+            func_pr_types
+        ) {
+            Ok(m) => Ok(m),
+            Err(e) => {
+                cfg_if::cfg_if! {
+                    if #[cfg(feature = "wat")] {
+                        let mut e = e.downcast::<wat::Error>()?;
+                        e.set_path(file);
+                        bail!(e)
+                    } else {
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
     /// Creates a new WebAssembly `Module` from the given in-memory `binary`
     /// data.
     ///
@@ -321,6 +360,55 @@ impl Module {
         Self::from_parts(engine, mmap, info, types)
     }
 
+    /// similar as from_binary, with extra parameter as parameter type information
+    #[cfg(compiler)]
+    #[cfg_attr(nightlydoc, doc(cfg(feature = "cranelift")))] // see build.rs
+    pub fn from_binary_with_pr_types(
+        engine: &Engine, 
+        binary: &[u8], 
+        func_pr_types: &FuncPRTypeCollection) -> Result<Module> {
+        engine
+            .check_compatible_with_native_host()
+            .context("compilation settings are not compatible with the native host")?;
+
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "cache")] {
+                let state = (HashedEngineCompileEnv(engine), binary);
+                let (mmap, info, types) = wasmtime_cache::ModuleCacheEntry::new(
+                    "wasmtime",
+                    engine.cache_config(),
+                )
+                .get_data_raw_with_pr_types(
+                    &state,
+                    func_pr_types,
+                    // Cache miss, compute the actual artifacts
+                    |(engine, wasm), func_pr_types| Module::build_artifacts_with_pr_types(engine.0, wasm, func_pr_types),
+
+                    // Implementation of how to serialize artifacts
+                    |(engine, _wasm), (mmap, _info, types)| {
+                        SerializedModule::from_artifacts(
+                            engine.0,
+                            mmap,
+                            types,
+                        ).to_bytes(&engine.0.config().module_version).ok()
+                    },
+
+                    // Cache hit, deserialize the provided artifacts
+                    |(engine, _wasm), serialized_bytes| {
+                        SerializedModule::from_bytes(&serialized_bytes, &engine.0.config().module_version)
+                            .ok()?
+                            .into_parts(engine.0)
+                            .ok()
+                    },
+                )?;
+            } else {
+                let (mmap, info, types) = Module::build_artifacts_with_param_type_collection(engine, binary, param_types)?;
+            }
+        };
+
+        Self::from_parts(engine, mmap, info, types)
+    }
+
     /// Converts an input binary-encoded WebAssembly module to compilation
     /// artifacts and type information.
     ///
@@ -344,7 +432,6 @@ impl Module {
         wasm: &[u8],
     ) -> Result<(MmapVec, Option<CompiledModuleInfo>, ModuleTypes)> {
         let tunables = &engine.config().tunables;
-
         // First a `ModuleEnvironment` is created which records type information
         // about the wasm module. This is where the WebAssembly is parsed and
         // validated. Afterwards `types` will have all the type information for
@@ -354,6 +441,30 @@ impl Module {
         let parser = wasmparser::Parser::new(0);
         let mut types = Default::default();
         let translation = ModuleEnvironment::new(tunables, &mut validator, &mut types)
+            .translate(parser, wasm)
+            .context("failed to parse WebAssembly module")?;
+        let types = types.finish();
+        let (mmap, info) = Module::compile_functions(engine, translation, &types)?;
+        Ok((mmap, info, types))
+    }
+
+    #[cfg(compiler)]
+    pub(crate) fn build_artifacts_with_pr_types(
+        engine: &Engine,
+        wasm: &[u8],
+        func_pr_types: &FuncPRTypeCollection
+    ) -> Result<(MmapVec, Option<CompiledModuleInfo>, ModuleTypes)> {
+        let tunables = &engine.config().tunables;
+
+        // First a `ModuleEnvironment` is created which records type information
+        // about the wasm module. This is where the WebAssembly is parsed and
+        // validated. Afterwards `types` will have all the type information for
+        // this module.
+        let mut validator =
+            wasmparser::Validator::new_with_features(engine.config().features.clone());
+        let parser = wasmparser::Parser::new(0);
+        let mut types = Default::default();
+        let translation = ModuleEnvironment::new_with_pr_types(tunables, &mut validator, &mut types, func_pr_types)
             .translate(parser, wasm)
             .context("failed to parse WebAssembly module")?;
         let types = types.finish();

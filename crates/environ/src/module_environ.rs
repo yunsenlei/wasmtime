@@ -19,6 +19,7 @@ use wasmparser::{
     ValidatorResources,
 };
 
+use wasmtime_param_types::*;
 /// Object containing the standalone environment information.
 pub struct ModuleEnvironment<'a, 'data> {
     /// The current module being translated
@@ -30,6 +31,9 @@ pub struct ModuleEnvironment<'a, 'data> {
     // Various bits and pieces of configuration
     validator: &'a mut Validator,
     tunables: &'a Tunables,
+
+    // a collection of function's parameter and return value types
+    func_pr_types: Option<&'a FuncPRTypeCollection>
 }
 
 /// The result of translating via `ModuleEnvironment`. Function bodies are not
@@ -146,6 +150,23 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
             types,
             tunables,
             validator,
+            func_pr_types: None
+        }
+    }
+    
+    /// similar to new, this constructor will create with an empty FuncParamTypeCollection for export_param_type 
+    pub fn new_with_pr_types(        
+        tunables: &'a Tunables,
+        validator: &'a mut Validator,
+        types: &'a mut ModuleTypesBuilder,
+        func_pr_types: &'a FuncPRTypeCollection
+    ) -> Self {
+        Self {
+            result: ModuleTranslation::default(),
+            types,
+            tunables,
+            validator,
+            func_pr_types: Some(func_pr_types)
         }
     }
 
@@ -233,11 +254,28 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
                     let import = entry?;
                     let ty = match import.ty {
                         TypeRef::Func(index) => {
-                            let index = TypeIndex::from_u32(index);
-                            let sig_index = self.result.module.types[index].unwrap_function();
-                            self.result.module.num_imported_funcs += 1;
-                            self.result.debuginfo.wasm_file.imported_func_count += 1;
-                            EntityType::Function(sig_index)
+                            //println!("import func name: {}, index: {}", import.name, index);
+                            if let Some(c) =  self.func_pr_types{
+                                
+                                // transfer the FuncParamRetType from our collection into the compiled module object
+                                // use string name to get the index, and then use index to get the FuncParamRetType
+                                let pr_ty = c.get(import.name).unwrap();
+                                let pr_index = self.result.module.func_pr_types.push(pr_ty.to_owned());
+                                self.result.module.pr_type_indexes.insert(import.name.to_string(), pr_index);
+
+                                let index = TypeIndex::from_u32(index);
+                                let sig_index = self.result.module.types[index].unwrap_function();
+                                self.result.module.num_imported_funcs += 1;
+                                self.result.debuginfo.wasm_file.imported_func_count += 1;
+                                EntityType::ParamTypedFunction(sig_index, pr_index)
+                            }
+                            else{
+                                let index = TypeIndex::from_u32(index);
+                                let sig_index = self.result.module.types[index].unwrap_function();
+                                self.result.module.num_imported_funcs += 1;
+                                self.result.debuginfo.wasm_file.imported_func_count += 1;
+                                EntityType::Function(sig_index)
+                            } 
                         }
                         TypeRef::Memory(ty) => {
                             self.result.module.num_imported_memories += 1;
@@ -352,10 +390,17 @@ impl<'a, 'data> ModuleEnvironment<'a, 'data> {
 
                 for entry in exports {
                     let wasmparser::Export { name, kind, index } = entry?;
+                    // println!("export name {}, index {}", name, index);
                     let entity = match kind {
                         ExternalKind::Func => {
                             let index = FuncIndex::from_u32(index);
                             self.flag_func_escaped(index);
+                            if let Some(c) =  self.func_pr_types{
+                                if let Some(pr_type) = c.get(name){
+                                    let p_index = self.result.module.func_pr_types.push(pr_type.to_owned());
+                                    self.result.module.update_function_parameter_type(index, p_index);
+                                }
+                            }
                             EntityIndex::Function(index)
                         }
                         ExternalKind::Table => EntityIndex::Table(TableIndex::from_u32(index)),
@@ -712,9 +757,19 @@ and for re-adding support for interface types you can see this issue:
         });
     }
 
+    // fn declare_import_with_pr_type(&mut self, module: &'data str, field: &'data str, ty: EntityType) {
+    //     let index = self.push_type_with_pr_type(ty, p_index);
+    //     self.result.module.initializers.push(Initializer::Import {
+    //         name: module.to_owned(),
+    //         field: field.to_owned(),
+    //         index,
+    //     });
+    // }
+
     fn push_type(&mut self, ty: EntityType) -> EntityIndex {
         match ty {
             EntityType::Function(ty) => EntityIndex::Function(self.result.module.push_function(ty)),
+            EntityType::ParamTypedFunction(ty, pr_ty) => EntityIndex::Function(self.result.module.push_function_with_pr_type(ty, pr_ty)),
             EntityType::Table(ty) => {
                 let plan = TablePlan::for_table(ty, &self.tunables);
                 EntityIndex::Table(self.result.module.table_plans.push(plan))
@@ -727,6 +782,22 @@ and for re-adding support for interface types you can see this issue:
             EntityType::Tag(_) => unimplemented!(),
         }
     }
+
+    // fn push_type_with_pr_type(&mut self, ty: EntityType, p_indx: ParamTypeIndex) -> EntityIndex {
+    //     match ty {
+    //         EntityType::Function(ty) => EntityIndex::Function(self.result.module.push_function_with_pr_type(ty, p_indx)),
+    //         EntityType::Table(ty) => {
+    //             let plan = TablePlan::for_table(ty, &self.tunables);
+    //             EntityIndex::Table(self.result.module.table_plans.push(plan))
+    //         }
+    //         EntityType::Memory(ty) => {
+    //             let plan = MemoryPlan::for_memory(ty, &self.tunables);
+    //             EntityIndex::Memory(self.result.module.memory_plans.push(plan))
+    //         }
+    //         EntityType::Global(ty) => EntityIndex::Global(self.result.module.globals.push(ty)),
+    //         EntityType::Tag(_) => unimplemented!(),
+    //     }
+    // }
 
     fn flag_func_escaped(&mut self, func: FuncIndex) {
         let ty = &mut self.result.module.functions[func];

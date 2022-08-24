@@ -1,19 +1,20 @@
 use crate::linker::Definition;
 use crate::store::{InstanceId, StoreOpaque, Stored};
-use crate::types::matching;
+use crate::types::{matching, self};
 use crate::{
     AsContextMut, Engine, Export, Extern, Func, Global, Memory, Module, SharedMemory,
-    StoreContextMut, Table, Trap, TypedFunc,
+    StoreContextMut, Table, Trap, TypedFunc, Val,
 };
 use anyhow::{anyhow, bail, Context, Error, Result};
+use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 use wasmtime_environ::{EntityType, FuncIndex, GlobalIndex, MemoryIndex, PrimaryMap, TableIndex};
 use wasmtime_runtime::{
     Imports, InstanceAllocationRequest, InstantiationError, StorePtr, VMContext, VMFunctionBody,
-    VMFunctionImport, VMGlobalImport, VMMemoryImport, VMOpaqueContext, VMTableImport,
+    VMFunctionImport, VMGlobalImport, VMMemoryImport, VMOpaqueContext, VMTableImport, InstanceHandle,
 };
-
+use std::net::{TcpListener};
 /// An instantiated WebAssembly module.
 ///
 /// This type represents the instantiation of a [`Module`]. Once instantiated
@@ -39,6 +40,11 @@ pub(crate) struct InstanceData {
     /// exports here matches the order of the exports in the the original
     /// module.
     exports: Vec<Option<Extern>>,
+
+    /// A list of imports, this is used for host process to find the Func object based guest process's call
+    /// In current implementation, we leverage the API Func::call to invoke a host function
+    /// The imported Extern is wrapped in Option so that we can fill in the values as the last step of creating the instance
+    import_funcs: HashMap<String, Option<Extern>>
 }
 
 impl Instance {
@@ -98,17 +104,34 @@ impl Instance {
     ///
     /// [inst]: https://webassembly.github.io/spec/core/exec/modules.html#exec-instantiation
     /// [`ExternType`]: crate::ExternType
-    pub fn new(
-        mut store: impl AsContextMut,
-        module: &Module,
-        imports: &[Extern],
+    // pub fn new(
+    //     mut store: impl AsContextMut,
+    //     module: &Module,
+    //     imports: &[Extern],
+    // ) -> Result<Instance, Error> {
+    //     let mut store = store.as_context_mut();
+    //     let imports = Instance::typecheck_externs(store.0, module, imports)?;
+    //     // Note that the unsafety here should be satisfied by the call to
+    //     // `typecheck_externs` above which satisfies the condition that all
+    //     // the imports are valid for this module.
+    //     unsafe { Instance::new_started(&mut store, module, imports.as_ref()) }
+    // }
+
+    /// create instance, but also add import information so it's convenient fo host process knows which imported function guest calls
+    pub fn new(mut store: impl AsContextMut, module: &Module, imports: &[(&str, Extern)]
     ) -> Result<Instance, Error> {
         let mut store = store.as_context_mut();
-        let imports = Instance::typecheck_externs(store.0, module, imports)?;
-        // Note that the unsafety here should be satisfied by the call to
-        // `typecheck_externs` above which satisfies the condition that all
-        // the imports are valid for this module.
-        unsafe { Instance::new_started(&mut store, module, imports.as_ref()) }
+        let ownedimports = Instance::typecheck_named_extern(store.0, module, imports)?;
+        if store.0.is_multi_process(){
+            unsafe { 
+                let mut instance = Instance::new_started(&mut store, module, ownedimports.as_ref())?;
+                instance.update_instance_imports(&mut store, imports);
+                Ok(instance)
+            }
+        }
+        else {
+            unsafe { Instance::new_started(&mut store, module, ownedimports.as_ref()) }
+        }  
     }
 
     /// Same as [`Instance::new`], except for usage in [asynchronous stores].
@@ -160,6 +183,33 @@ impl Instance {
             owned_imports.push(import, store);
         }
         Ok(owned_imports)
+    }
+
+    fn typecheck_named_extern(store: &mut StoreOpaque,
+        module: &Module, imports: &[(&str, Extern)]
+    ) -> Result<OwnedImports> {
+        // let import_names: Vec<&str> = imports.iter().map(|t|{t.0}).collect();    
+        let import_externs: Vec<Extern> = imports.iter().map(|t|{t.1.clone()}).collect();   
+        for import in import_externs.as_slice() {
+            if !import.comes_from_same_store(store) {
+                bail!("cross-`Store` instantiation is not currently supported");
+            }
+        }
+        typecheck(store, module, import_externs.as_slice(), |cx, ty, item| cx.extern_(ty, item))?;
+        let mut owned_imports = OwnedImports::new(module);
+        for (name,import) in imports {
+            owned_imports.push_with_name(import, name, store);
+        }
+        Ok(owned_imports)
+    }
+
+    /// insert imported externs into InstanceData
+    pub fn update_instance_imports(&mut self, mut store: impl AsContextMut, imports: &[(&str, Extern)]){
+        let store_data = store.as_context_mut().0.store_data_mut();
+        let instance = &mut store_data[self.0];
+        for (name, e) in imports{
+            instance.import_funcs.insert(name.to_string(), Some(e.clone()));
+        }
     }
 
     /// Internal function to create an instance and run the start function.
@@ -294,7 +344,8 @@ impl Instance {
         // those here.
         let instance = {
             let exports = vec![None; compiled_module.module().exports.len()];
-            let data = InstanceData { id, exports };
+            let import_funcs = HashMap::new();
+            let data = InstanceData { id, exports, import_funcs};
             Instance::from_wasmtime(data, store)
         };
 
@@ -354,6 +405,63 @@ impl Instance {
         Ok(())
     }
 
+    /// handle host call for a seperated guest process
+    pub fn handle_call_for_guest(&self, mut store: impl AsContextMut) -> Result<()>{
+        let listener = TcpListener::bind("127.0.0.1:10000").unwrap();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            // find function's parameter type information and storage to unpack data
+            let id = store.as_context().0.store_data()[self.0].id;
+            let instance: &mut InstanceHandle = store.as_context_mut().0.instance_mut(id);
+            if let Ok(recv_param_ret_data) = Func::receive_data(&mut stream){
+                let calling_func = recv_param_ret_data.get_func_name();
+            
+                // get function's parameter type information and data storage
+                let pr_index = instance.module().pr_type_indexes.get(calling_func).unwrap();
+                let pr_ty = instance.module().func_pr_types.get(pr_index.clone()).unwrap();
+                let func_storage_index = pr_ty.index().unwrap();
+                
+                let mut params = Vec::<Val>::new();                
+                {
+                // unpack received data into function storage and push the data on stack
+                let func_storage = &mut store.as_context_mut().0.store_data_mut().func_data_mut()[func_storage_index];
+                recv_param_ret_data.unpack_to(func_storage);
+                for val in &func_storage.param_vals{
+                    params.push(val.clone())}   
+                }
+                println!("push to stack");
+                store.as_context_mut().0.push_host_stack(func_storage_index); 
+
+                // get a handle of the host function and call it
+                let instance_data = &store.as_context_mut().0.store_data()[self.0];
+                let host_func = instance_data.import_funcs.get(&calling_func.to_string()).unwrap().as_ref().unwrap().clone();
+                let host_func = host_func.into_func().unwrap();
+                let mut results = Vec::<Val>::new();
+                for ty in host_func.ty(&mut store).results(){
+                    match ty {
+                        types::ValType::I32 => { results.push(Val::I32(0))}
+                        types::ValType::I64 => { results.push(Val::I64(0))}
+                        types::ValType::F32 => {results.push(Val::F32(0))}
+                        types::ValType::F64 => {results.push(Val::F64(0))}
+                        types::ValType::V128 => {results.push(Val::V128(0))}
+                        types::ValType::FuncRef => {results.push(Val::FuncRef(None))}
+                        types::ValType::ExternRef => {results.push(Val::ExternRef(None))}
+                    }
+                }
+                host_func.call(&mut store, &params, &mut results)?;
+                let func_storage = &mut store.as_context_mut().0.store_data_mut().func_data_mut()[func_storage_index];
+                func_storage.push_ret_vals(&results);
+
+                Func::send_data(&mut stream, func_storage)?;
+                store.as_context_mut().0.pop_host_stack();
+
+            }
+        }
+        Ok(())
+    }
+
+    
+
     /// Returns the list of exported items from this [`Instance`].
     ///
     /// # Panics
@@ -410,6 +518,11 @@ impl Instance {
         self._get_export(store.as_context_mut().0, name)
     }
 
+    /// Similar to get_export, but the export must has an parameter type (e.g, a parameter typed function)
+    pub fn get_param_typed_export(&self, mut store: impl AsContextMut, name: &str)  -> Option<Extern>{
+        self._get_param_typed_export(store.as_context_mut().0, name)
+    }
+
     fn _get_export(&self, store: &mut StoreOpaque, name: &str) -> Option<Extern> {
         // Instantiated instances will lazily fill in exports, so we process
         // all that lazy logic here.
@@ -430,6 +543,33 @@ impl Instance {
         Some(item)
     }
 
+    fn _get_param_typed_export(&self, store: &mut StoreOpaque, name: &str) -> Option<Extern> {
+        // Instantiated instances will lazily fill in exports, so we process
+        // all that lazy logic here.
+        let data = &store[self.0];
+
+        let instance = store.instance(data.id);
+        let (i, _, &index) = instance.module().exports.get_full(name)?;
+        if let Some(export) = &data.exports[i] {
+            return Some(export.clone());
+        }
+
+        let id = data.id;
+        let instance = store.instance_mut(id); // reborrow the &mut Instancehandle
+        if let Some(param_types) = instance.get_expored_func_param_types(index){
+            let param_types = param_types.clone();
+            let export = instance.get_export_by_index(index);
+            let item =  unsafe {Extern::from_wasmtime_export_and_pr_type(export, store, param_types).unwrap()};
+            let data = &mut store[self.0];
+            data.exports[i] = Some(item.clone());
+            Some(item)
+        }
+        else{
+            None
+        }
+
+    }
+
     /// Looks up an exported [`Func`] value by name.
     ///
     /// Returns `None` if there was no export named `name`, or if there was but
@@ -440,6 +580,11 @@ impl Instance {
     /// Panics if `store` does not own this instance.
     pub fn get_func(&self, store: impl AsContextMut, name: &str) -> Option<Func> {
         self.get_export(store, name)?.into_func()
+    }
+
+    /// Similar to get_func, but the function must be specified with parameter type
+    pub fn get_param_typed_func(&self, store: impl AsContextMut, name: &str) -> Option<Func> {
+        self.get_param_typed_export(store, name)?.into_func()
     }
 
     /// Looks up an exported [`Func`] value by name and with its type.
@@ -532,6 +677,7 @@ impl Instance {
 
 pub(crate) struct OwnedImports {
     functions: PrimaryMap<FuncIndex, VMFunctionImport>,
+    func_names: Vec<String>,
     tables: PrimaryMap<TableIndex, VMTableImport>,
     memories: PrimaryMap<MemoryIndex, VMMemoryImport>,
     globals: PrimaryMap<GlobalIndex, VMGlobalImport>,
@@ -547,6 +693,7 @@ impl OwnedImports {
     pub(crate) fn empty() -> OwnedImports {
         OwnedImports {
             functions: PrimaryMap::new(),
+            func_names: Vec::new(),
             tables: PrimaryMap::new(),
             memories: PrimaryMap::new(),
             globals: PrimaryMap::new(),
@@ -556,6 +703,7 @@ impl OwnedImports {
     pub(crate) fn reserve(&mut self, module: &Module) {
         let raw = module.compiled_module().module();
         self.functions.reserve(raw.num_imported_funcs);
+        self.func_names.reserve(raw.num_imported_funcs);
         self.tables.reserve(raw.num_imported_tables);
         self.memories.reserve(raw.num_imported_memories);
         self.globals.reserve(raw.num_imported_globals);
@@ -573,6 +721,28 @@ impl OwnedImports {
         match item {
             Extern::Func(i) => {
                 self.functions.push(i.vmimport(store));
+            }
+            Extern::Global(i) => {
+                self.globals.push(i.vmimport(store));
+            }
+            Extern::Table(i) => {
+                self.tables.push(i.vmimport(store));
+            }
+            Extern::Memory(i) => {
+                self.memories.push(i.vmimport(store));
+            }
+            Extern::SharedMemory(i) => {
+                self.memories.push(i.vmimport(store));
+            }
+        }
+    }
+
+    fn push_with_name(&mut self, item: &Extern, item_name: &str, store: &mut StoreOpaque){
+        
+        match item {
+            Extern::Func(i) => {
+                self.functions.push(i.vmimport(store));
+                self.func_names.push(item_name.to_string());
             }
             Extern::Global(i) => {
                 self.globals.push(i.vmimport(store));
@@ -626,6 +796,7 @@ impl OwnedImports {
             globals: self.globals.values().as_slice(),
             memories: self.memories.values().as_slice(),
             functions: self.functions.values().as_slice(),
+            func_names: self.func_names.as_slice(),
         }
     }
 }
@@ -744,6 +915,10 @@ impl<T> InstancePre<T> {
         // in match the module we're instantiating.
         unsafe { Instance::new_started(&mut store, &self.module, imports.as_ref()) }
     }
+
+    // pub fn instantiate_with_params_type(&self, mut store: impl AsContextMut<Data = T>) -> Result<Instance> {
+
+    // }
 
     /// Creates a new instance, running the start function asynchronously
     /// instead of inline.

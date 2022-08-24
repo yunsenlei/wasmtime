@@ -82,6 +82,7 @@ members = [
   "examples/fib-debug/wasm",
   "examples/wasi/wasm",
   "examples/tokio/wasm",
+  "examples/multi-process-demo",
   "fuzz",
 ]
 exclude = [

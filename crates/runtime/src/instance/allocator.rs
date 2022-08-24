@@ -552,6 +552,7 @@ unsafe impl InstanceAllocator for OnDemandInstanceAllocator {
         &self,
         mut req: InstanceAllocationRequest,
     ) -> Result<InstanceHandle, InstantiationError> {
+        // println!("[OnDemandInstanceAllocator]: allocate");
         let memories = self.create_memories(&mut req.store, &req.runtime_info)?;
         let tables = Self::create_tables(&mut req.store, &req.runtime_info)?;
         let module = req.runtime_info.module();
