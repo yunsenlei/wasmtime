@@ -1131,7 +1131,6 @@ impl<T> StoreInner<T> {
     }
 
     pub fn is_multi_process(&self)-> bool {
-        println!("{}", self.multi_process);
         self.multi_process
     }
 }
